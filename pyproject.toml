@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open3d-mlx"
+version = "0.1.0"
+description = "Apple Silicon-native 3D perception pipelines via MLX"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "AIFLOW LABS", email = "ilessio@aiflowlabs.io"}
+]
+keywords = ["3d", "point-cloud", "icp", "mlx", "apple-silicon", "robotics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+
+dependencies = [
+    "mlx>=0.22.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-benchmark>=4.0",
+    "ruff>=0.4.0",
+]
+interop = [
+    "open3d>=0.18.0",
+    "scipy>=1.10.0",
+]
+all = [
+    "open3d-mlx[dev,interop]",
+]
+
+[project.urls]
+Homepage = "https://github.com/RobotFlow-Labs/open3d-mlx"
+Repository = "https://github.com/RobotFlow-Labs/open3d-mlx"
+
+[tool.setuptools.packages.find]
+include = ["open3d_mlx*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
