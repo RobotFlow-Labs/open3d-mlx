@@ -7,8 +7,8 @@
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white">
   <img alt="MLX" src="https://img.shields.io/badge/MLX-%E2%89%A50.22-000000?logo=apple&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-477%20passing-brightgreen">
-  <img alt="Lines of Code" src="https://img.shields.io/badge/source-5.6k%20lines-informational">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-572%20passing-brightgreen">
+  <img alt="Lines of Code" src="https://img.shields.io/badge/source-7.5k%20lines-informational">
 </p>
 
 ---
@@ -152,20 +152,34 @@ gantt
 
 ---
 
+## Project Stats
+
+| Metric | Value |
+|--------|-------|
+| Source files | 42 |
+| Test files | 41 |
+| Source lines | 7,480 |
+| Test lines | 6,837 |
+| Tests passing | 572 |
+| Tests skipped | 7 (optional open3d interop) |
+| Benchmark files | 7 (30 benchmarks) |
+| Examples | 8 working scripts |
+| PRDs | 13 completed |
+| Commits | 8 |
+
 ## Module Overview
 
-| Module | Description | Source Lines | Tests |
-|--------|-------------|:-----------:|:-----:|
-| `open3d_mlx.core` | MLX tensor utilities, device abstraction, dtype mapping | 415 | 70 |
-| `open3d_mlx.geometry` | `PointCloud`, KDTree search parameters, transforms | 938 | 86 |
-| `open3d_mlx.io` | Point cloud file I/O (PLY, PCD -- ASCII and binary) | 986 | 47 |
-| `open3d_mlx.ops` | Nearest neighbor, fixed-radius NN, normals, linalg | 784 | 52 |
-| `open3d_mlx.camera` | Pinhole camera intrinsics | 44 | 4 |
-| `open3d_mlx.pipelines.registration` | ICP (point-to-point, point-to-plane), robust kernels | 921 | 95 |
-| `open3d_mlx.pipelines.integration` | TSDF volume integration, marching cubes extraction | 808 | 40 |
-| `open3d_mlx.pipelines.raycasting` | Volume raycasting (TSDF to depth/normals) | 536 | 15 |
-| `open3d_mlx.interop` | Conversion to/from vanilla Open3D | 123 | 9 |
-| **Total** | | **5,601** | **441+** |
+| Module | Description | Key Features |
+|--------|-------------|-------------|
+| `open3d_mlx.core` | Dtype mapping, device abstraction, tensor utilities | float64/int64 auto-downcast, MLX array helpers |
+| `open3d_mlx.geometry` | `PointCloud`, `AxisAlignedBoundingBox`, KDTree params | Transforms, voxel/uniform/random/farthest downsampling, crop, normals, outlier removal |
+| `open3d_mlx.io` | Point cloud file I/O | PLY, PCD, XYZ, PTS (ASCII + binary) |
+| `open3d_mlx.ops` | GPU-accelerated primitive operations | FixedRadiusIndex (spatial hash), NearestNeighborSearch (KDTree), batched PCA normals |
+| `open3d_mlx.camera` | Camera models | PinholeCameraIntrinsic with K matrix |
+| `open3d_mlx.pipelines.registration` | ICP registration pipeline | P2P, P2Plane, Colored ICP, GICP, multi-scale, 5 robust kernels, FPFH features, correspondence checkers |
+| `open3d_mlx.pipelines.integration` | TSDF volume reconstruction | UniformTSDFVolume, ScalableTSDFVolume (hash-based), marching cubes mesh extraction |
+| `open3d_mlx.pipelines.raycasting` | Volume raycasting | Adaptive sphere-tracing, depth/normal map rendering, trilinear interpolation |
+| `open3d_mlx.interop` | Open3D bridge | `to_open3d()`, `from_open3d()`, `to_open3d_tensor()` |
 
 ---
 
@@ -356,8 +370,10 @@ open3d_mlx/
     integration/       # TSDF volume, marching cubes
     raycasting/        # Volume raycasting
   interop.py           # Open3D conversion helpers
-tests/                 # 441+ tests mirroring source structure
-benchmarks/            # Performance comparisons
+tests/                 # 572 tests mirroring source structure
+benchmarks/            # 30 benchmarks (ICP, TSDF, NN, I/O, PointCloud)
+examples/              # 8 working example scripts
+prds/                  # 13 build PRDs with dependency graph
 ```
 
 ---
