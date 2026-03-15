@@ -356,14 +356,23 @@ def write_ply(
                     ]
                 f.write((" ".join(parts) + "\n").encode("ascii"))
         else:
-            # Binary little-endian
-            for i in range(n):
-                f.write(struct.pack("<fff", points[i, 0], points[i, 1], points[i, 2]))
-                if normals is not None:
-                    f.write(
-                        struct.pack(
-                            "<fff", normals[i, 0], normals[i, 1], normals[i, 2]
-                        )
-                    )
-                if colors is not None:
-                    f.write(struct.pack("<BBB", colors[i, 0], colors[i, 1], colors[i, 2]))
+            # Binary little-endian — build structured array and write in bulk
+            dtype_fields = [('x', '<f4'), ('y', '<f4'), ('z', '<f4')]
+            if normals is not None:
+                dtype_fields += [('nx', '<f4'), ('ny', '<f4'), ('nz', '<f4')]
+            if colors is not None:
+                dtype_fields += [('red', '<u1'), ('green', '<u1'), ('blue', '<u1')]
+
+            vertex_data = np.empty(n, dtype=np.dtype(dtype_fields))
+            vertex_data['x'] = points[:, 0]
+            vertex_data['y'] = points[:, 1]
+            vertex_data['z'] = points[:, 2]
+            if normals is not None:
+                vertex_data['nx'] = normals[:, 0]
+                vertex_data['ny'] = normals[:, 1]
+                vertex_data['nz'] = normals[:, 2]
+            if colors is not None:
+                vertex_data['red'] = colors[:, 0]
+                vertex_data['green'] = colors[:, 1]
+                vertex_data['blue'] = colors[:, 2]
+            f.write(vertex_data.tobytes())

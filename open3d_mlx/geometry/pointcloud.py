@@ -349,7 +349,7 @@ class PointCloud:
 
         n = len(self)
         if isinstance(indices, mx.array):
-            idx_np = np.array(indices.tolist(), dtype=np.intp)
+            idx_np = np.asarray(indices, dtype=np.intp)
         else:
             idx_np = np.asarray(indices, dtype=np.intp)
 
@@ -382,7 +382,7 @@ class PointCloud:
         PointCloud
         """
         if isinstance(mask, mx.array):
-            m_np = np.array(mask.tolist(), dtype=bool)
+            m_np = np.asarray(mask, dtype=bool)
         else:
             m_np = np.asarray(mask, dtype=bool)
 
@@ -414,7 +414,7 @@ class PointCloud:
         if self.is_empty():
             return PointCloud()
 
-        pts_np = np.array(self._points.tolist(), dtype=np.float32)
+        pts_np = np.asarray(self._points, dtype=np.float32)
         finite_mask = np.all(np.isfinite(pts_np), axis=1)
         return self.select_by_mask(finite_mask)
 
@@ -428,7 +428,7 @@ class PointCloud:
         if self.is_empty():
             return PointCloud()
 
-        pts_np = np.array(self._points.tolist(), dtype=np.float32)
+        pts_np = np.asarray(self._points, dtype=np.float32)
         _, unique_idx = np.unique(pts_np, axis=0, return_index=True)
         unique_idx = np.sort(unique_idx)  # preserve original order
         return self.select_by_index(unique_idx)
@@ -460,23 +460,15 @@ class PointCloud:
         if self.is_empty():
             return PointCloud()
 
-        pts_np = np.array(self._points.tolist(), dtype=np.float32)
+        pts_np = np.asarray(self._points, dtype=np.float32)
         n = pts_np.shape[0]
 
         # Voxel indices
         voxel_idx = np.floor(pts_np / voxel_size).astype(np.int64)
 
-        # Spatial hash
-        P1, P2, P3 = 73856093, 19349663, 83492791
-        keys = (
-            voxel_idx[:, 0] * P1
-            + voxel_idx[:, 1] * P2
-            + voxel_idx[:, 2] * P3
-        )
-
-        # Find unique voxels and group
-        unique_keys, inverse = np.unique(keys, return_inverse=True)
-        n_voxels = len(unique_keys)
+        # Collision-free uniqueness using np.unique on axis=0
+        _, inverse = np.unique(voxel_idx, axis=0, return_inverse=True)
+        n_voxels = int(inverse.max() + 1)
 
         # Average positions within each voxel
         new_pts = np.zeros((n_voxels, 3), dtype=np.float64)
@@ -489,7 +481,7 @@ class PointCloud:
 
         # Average normals (then re-normalize)
         if self.has_normals():
-            nrm_np = np.array(self._normals.tolist(), dtype=np.float64)
+            nrm_np = np.asarray(self._normals, dtype=np.float64)
             new_nrm = np.zeros((n_voxels, 3), dtype=np.float64)
             np.add.at(new_nrm, inverse, nrm_np)
             lengths = np.linalg.norm(new_nrm, axis=1, keepdims=True)
@@ -499,7 +491,7 @@ class PointCloud:
 
         # Average colors (clamp to [0, 1])
         if self.has_colors():
-            col_np = np.array(self._colors.tolist(), dtype=np.float64)
+            col_np = np.asarray(self._colors, dtype=np.float64)
             new_col = np.zeros((n_voxels, 3), dtype=np.float64)
             np.add.at(new_col, inverse, col_np)
             new_col /= counts[:, None]
@@ -581,7 +573,7 @@ class PointCloud:
 
         new_pcd._colors = mx.broadcast_to(c[None, :], (len(self), 3))
         # Ensure contiguous storage
-        new_pcd._colors = mx.array(np.array(new_pcd._colors.tolist(), dtype=np.float32))
+        new_pcd._colors = mx.array(np.asarray(new_pcd._colors, dtype=np.float32))
         return new_pcd
 
     # ------------------------------------------------------------------
@@ -595,17 +587,37 @@ class PointCloud:
     ) -> None:
         """Estimate normals using PCA on local neighbourhoods.
 
-        .. note:: Requires KNN (PRD-04). Currently raises ``NotImplementedError``.
+        Uses KNN (or hybrid radius+KNN) search to find local neighborhoods,
+        then computes normals via PCA (smallest eigenvector of covariance).
+
+        Parameters
+        ----------
+        max_nn : int
+            Maximum number of neighbors for PCA. Default 30.
+        radius : float or None
+            If given, use hybrid search (radius + max_nn constraint).
+            If None, use pure KNN search with k=max_nn.
         """
-        raise NotImplementedError(
-            "estimate_normals requires KNN from PRD-04. Not yet implemented."
-        )
+        if self.is_empty():
+            return
+
+        from open3d_mlx.ops.nearest_neighbor import NearestNeighborSearch
+        from open3d_mlx.ops.normals import estimate_normals_pca
+
+        nns = NearestNeighborSearch(self._points)
+        if radius is not None:
+            indices, _, _ = nns.hybrid_search(
+                self._points, radius=radius, max_nn=max_nn
+            )
+        else:
+            indices, _ = nns.knn_search(self._points, k=max_nn)
+        self._normals = estimate_normals_pca(self._points, indices)
 
     def normalize_normals(self) -> None:
         """Normalize all normals to unit length. Modifies in-place."""
         if not self.has_normals():
             return
-        nrm_np = np.array(self._normals.tolist(), dtype=np.float64)
+        nrm_np = np.asarray(self._normals, dtype=np.float64)
         lengths = np.linalg.norm(nrm_np, axis=1, keepdims=True)
         lengths = np.maximum(lengths, 1e-12)
         nrm_np /= lengths
@@ -616,10 +628,20 @@ class PointCloud:
     ) -> None:
         """Orient normals to face camera. Default camera at origin.
 
-        .. note:: Requires KNN (PRD-04). Currently raises ``NotImplementedError``.
+        Flips normals so that they point towards the given camera location.
+
+        Parameters
+        ----------
+        camera_location : mx.array or None
+            ``(3,)`` camera position. Defaults to origin ``[0, 0, 0]``.
         """
-        raise NotImplementedError(
-            "orient_normals_towards_camera requires KNN from PRD-04."
+        if not self.has_normals():
+            return
+
+        from open3d_mlx.ops.normals import orient_normals_towards_viewpoint
+
+        self._normals = orient_normals_towards_viewpoint(
+            self._points, self._normals, viewpoint=camera_location
         )
 
     # ------------------------------------------------------------------
@@ -629,24 +651,85 @@ class PointCloud:
     def remove_statistical_outliers(
         self, nb_neighbors: int = 20, std_ratio: float = 2.0
     ) -> tuple["PointCloud", mx.array]:
-        """Remove statistical outliers.
+        """Remove statistical outliers based on mean distance to neighbors.
 
-        .. note:: Requires KNN (PRD-04). Currently raises ``NotImplementedError``.
+        For each point, computes the mean distance to its K nearest neighbors.
+        Points whose mean distance is beyond ``mean + std_ratio * std`` of the
+        global distribution are considered outliers.
+
+        Parameters
+        ----------
+        nb_neighbors : int
+            Number of neighbors for mean distance computation.
+        std_ratio : float
+            Standard deviation multiplier threshold.
+
+        Returns
+        -------
+        tuple[PointCloud, mx.array]
+            (filtered_cloud, inlier_indices)
         """
-        raise NotImplementedError(
-            "remove_statistical_outliers requires KNN from PRD-04."
-        )
+        if self.is_empty():
+            return PointCloud(), mx.array(np.array([], dtype=np.int32))
+
+        from open3d_mlx.ops.nearest_neighbor import NearestNeighborSearch
+
+        nns = NearestNeighborSearch(self._points)
+        # k+1 because the point itself is its own nearest neighbor at distance 0
+        k = min(nb_neighbors + 1, len(self))
+        indices, sq_dists = nns.knn_search(self._points, k=k)
+
+        # Skip the first neighbor (self) — take columns 1:
+        if k > 1:
+            sq_dists_neighbors = np.asarray(sq_dists[:, 1:], dtype=np.float64)
+        else:
+            sq_dists_neighbors = np.asarray(sq_dists, dtype=np.float64)
+
+        mean_dists = np.sqrt(sq_dists_neighbors).mean(axis=1)
+        global_mean = mean_dists.mean()
+        global_std = mean_dists.std()
+
+        threshold = global_mean + std_ratio * global_std
+        inlier_mask = mean_dists <= threshold
+        inlier_indices = np.nonzero(inlier_mask)[0]
+
+        return self.select_by_index(inlier_indices), mx.array(inlier_indices.astype(np.int32))
 
     def remove_radius_outliers(
         self, nb_points: int = 2, search_radius: float = 1.0
     ) -> tuple["PointCloud", mx.array]:
-        """Remove radius outliers.
+        """Remove points that have fewer than ``nb_points`` neighbors within ``search_radius``.
 
-        .. note:: Requires radius search (PRD-04). Currently raises ``NotImplementedError``.
+        Parameters
+        ----------
+        nb_points : int
+            Minimum number of neighbors required to keep a point.
+        search_radius : float
+            Radius for neighbor search.
+
+        Returns
+        -------
+        tuple[PointCloud, mx.array]
+            (filtered_cloud, inlier_indices)
         """
-        raise NotImplementedError(
-            "remove_radius_outliers requires radius search from PRD-04."
-        )
+        if self.is_empty():
+            return PointCloud(), mx.array(np.array([], dtype=np.int32))
+
+        from open3d_mlx.ops.nearest_neighbor import NearestNeighborSearch
+
+        nns = NearestNeighborSearch(self._points)
+        idx_lists, _ = nns.radius_search(self._points, radius=search_radius)
+
+        # Count neighbors (excluding self — the point itself is always found)
+        inlier_indices = []
+        for i, idx_arr in enumerate(idx_lists):
+            # Subtract 1 for self-match
+            n_neighbors = len(np.asarray(idx_arr)) - 1
+            if n_neighbors >= nb_points:
+                inlier_indices.append(i)
+
+        inlier_indices = np.array(inlier_indices, dtype=np.int32)
+        return self.select_by_index(inlier_indices), mx.array(inlier_indices)
 
     # ------------------------------------------------------------------
     # Interop
@@ -665,15 +748,11 @@ class PointCloud:
         if self.is_empty():
             result["points"] = np.zeros((0, 3), dtype=np.float32)
         else:
-            result["points"] = np.array(self.points.tolist(), dtype=np.float32)
+            result["points"] = np.asarray(self.points, dtype=np.float32)
         if self.has_normals():
-            result["normals"] = np.array(
-                self._normals.tolist(), dtype=np.float32
-            )
+            result["normals"] = np.asarray(self._normals, dtype=np.float32)
         if self.has_colors():
-            result["colors"] = np.array(
-                self._colors.tolist(), dtype=np.float32
-            )
+            result["colors"] = np.asarray(self._colors, dtype=np.float32)
         return result
 
     @classmethod

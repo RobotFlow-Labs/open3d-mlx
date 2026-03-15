@@ -602,26 +602,95 @@ class TestNumpyInterop:
 # Stubs / NotImplementedError
 # ===================================================================
 
-class TestStubs:
-    def test_estimate_normals_raises(self):
-        pcd = PointCloud(_random_points(5))
-        with pytest.raises(NotImplementedError):
-            pcd.estimate_normals()
+class TestWiredUpMethods:
+    """Tests for estimate_normals, outlier removal, and orient_normals."""
 
-    def test_statistical_outliers_raises(self):
-        pcd = PointCloud(_random_points(5))
-        with pytest.raises(NotImplementedError):
-            pcd.remove_statistical_outliers()
+    def test_estimate_normals_knn(self):
+        """estimate_normals should produce unit normals for a planar point cloud."""
+        # Create a grid of points on the XY plane (z=0)
+        xs = np.linspace(0, 1, 10)
+        ys = np.linspace(0, 1, 10)
+        xx, yy = np.meshgrid(xs, ys)
+        pts = np.stack([xx.ravel(), yy.ravel(), np.zeros(100)], axis=1).astype(np.float32)
+        pcd = PointCloud(mx.array(pts))
+        pcd.estimate_normals(max_nn=10)
+        assert pcd.has_normals()
+        normals_np = np.asarray(pcd.normals, dtype=np.float32)
+        # All normals should be unit length
+        lengths = np.linalg.norm(normals_np, axis=1)
+        npt.assert_allclose(lengths, 1.0, atol=1e-5)
+        # For a flat XY plane, normals should be approximately +/- z-axis
+        npt.assert_allclose(np.abs(normals_np[:, 2]), 1.0, atol=0.1)
 
-    def test_radius_outliers_raises(self):
-        pcd = PointCloud(_random_points(5))
-        with pytest.raises(NotImplementedError):
-            pcd.remove_radius_outliers()
+    def test_estimate_normals_hybrid(self):
+        """estimate_normals with radius should also work."""
+        pts = _random_points(50)
+        pcd = PointCloud(mx.array(pts))
+        pcd.estimate_normals(max_nn=10, radius=2.0)
+        assert pcd.has_normals()
+        assert pcd.normals.shape == (50, 3)
 
-    def test_orient_normals_raises(self):
+    def test_estimate_normals_empty(self):
+        """estimate_normals on empty cloud is a no-op."""
+        pcd = PointCloud()
+        pcd.estimate_normals()  # should not raise
+        assert not pcd.has_normals()
+
+    def test_remove_statistical_outliers(self):
+        """Statistical outlier removal should remove far-away points."""
+        # Cluster of 50 points near origin + 2 outliers far away
+        cluster = np.random.default_rng(42).normal(0, 0.1, (50, 3)).astype(np.float32)
+        outliers = np.array([[100, 100, 100], [-100, -100, -100]], dtype=np.float32)
+        pts = np.vstack([cluster, outliers])
+        pcd = PointCloud(mx.array(pts))
+        filtered, indices = pcd.remove_statistical_outliers(nb_neighbors=10, std_ratio=2.0)
+        # The 2 outliers should be removed
+        assert len(filtered) <= 52
+        assert len(filtered) >= 48  # most of the cluster survives
+        # Outlier indices (50, 51) should not be in inlier list
+        idx_np = np.asarray(indices, dtype=np.int32)
+        assert 50 not in idx_np
+        assert 51 not in idx_np
+
+    def test_remove_statistical_outliers_empty(self):
+        pcd = PointCloud()
+        filtered, indices = pcd.remove_statistical_outliers()
+        assert len(filtered) == 0
+
+    def test_remove_radius_outliers(self):
+        """Radius outlier removal should remove isolated points."""
+        cluster = np.random.default_rng(42).normal(0, 0.1, (50, 3)).astype(np.float32)
+        outlier = np.array([[50, 50, 50]], dtype=np.float32)
+        pts = np.vstack([cluster, outlier])
+        pcd = PointCloud(mx.array(pts))
+        filtered, indices = pcd.remove_radius_outliers(nb_points=2, search_radius=1.0)
+        assert len(filtered) <= 51
+        # The far outlier should be removed
+        idx_np = np.asarray(indices, dtype=np.int32)
+        assert 50 not in idx_np
+
+    def test_remove_radius_outliers_empty(self):
+        pcd = PointCloud()
+        filtered, indices = pcd.remove_radius_outliers()
+        assert len(filtered) == 0
+
+    def test_orient_normals_towards_camera(self):
+        """orient_normals_towards_camera should flip normals to face the camera."""
+        pts = np.array([[0, 0, 1], [0, 0, 2], [0, 0, 3]], dtype=np.float32)
+        # Normals pointing away from origin (same direction as points)
+        nrm = np.array([[0, 0, 1], [0, 0, 1], [0, 0, 1]], dtype=np.float32)
+        pcd = PointCloud(mx.array(pts))
+        pcd.normals = mx.array(nrm)
+        # Camera at origin -> normals should flip to point towards origin
+        pcd.orient_normals_towards_camera(camera_location=mx.array([0.0, 0.0, 0.0]))
+        result = np.asarray(pcd.normals, dtype=np.float32)
+        # All normals should now point in -z direction
+        npt.assert_allclose(result[:, 2], -1.0, atol=1e-5)
+
+    def test_orient_normals_no_normals(self):
+        """orient_normals_towards_camera on cloud without normals is a no-op."""
         pcd = PointCloud(_random_points(5))
-        with pytest.raises(NotImplementedError):
-            pcd.orient_normals_towards_camera()
+        pcd.orient_normals_towards_camera()  # should not raise
 
 
 # ===================================================================
@@ -635,7 +704,7 @@ class TestNormalizeNormals:
                          [1, 1, 0], [1, 1, 1]], dtype=np.float32)
         pcd.normals = mx.array(nrm)
         pcd.normalize_normals()
-        result = np.array(pcd.normals.tolist())
+        result = np.asarray(pcd.normals)
         lengths = np.linalg.norm(result, axis=1)
         npt.assert_allclose(lengths, 1.0, atol=1e-5)
 

@@ -382,16 +382,21 @@ def write_pcd(
                     parts.append(str(int(rgb_int)))
                 f.write((" ".join(parts) + "\n").encode("ascii"))
         else:
-            for i in range(n):
-                f.write(struct.pack("<fff", points[i, 0], points[i, 1], points[i, 2]))
-                if normals is not None:
-                    f.write(
-                        struct.pack(
-                            "<fff",
-                            normals[i, 0],
-                            normals[i, 1],
-                            normals[i, 2],
-                        )
-                    )
-                if rgb_packed is not None:
-                    f.write(struct.pack("<f", rgb_packed[i]))
+            # Binary — build structured array and write in bulk
+            dtype_fields = [('x', '<f4'), ('y', '<f4'), ('z', '<f4')]
+            if normals is not None:
+                dtype_fields += [('nx', '<f4'), ('ny', '<f4'), ('nz', '<f4')]
+            if rgb_packed is not None:
+                dtype_fields.append(('rgb', '<f4'))
+
+            vertex_data = np.empty(n, dtype=np.dtype(dtype_fields))
+            vertex_data['x'] = points[:, 0]
+            vertex_data['y'] = points[:, 1]
+            vertex_data['z'] = points[:, 2]
+            if normals is not None:
+                vertex_data['nx'] = normals[:, 0]
+                vertex_data['ny'] = normals[:, 1]
+                vertex_data['nz'] = normals[:, 2]
+            if rgb_packed is not None:
+                vertex_data['rgb'] = rgb_packed
+            f.write(vertex_data.tobytes())
