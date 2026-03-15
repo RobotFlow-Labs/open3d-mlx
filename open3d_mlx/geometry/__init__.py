@@ -1,5 +1,6 @@
 """Geometry types for Open3D-MLX."""
 
+from open3d_mlx.geometry.boundingbox import AxisAlignedBoundingBox
 from open3d_mlx.geometry.kdtree import (
     KDTreeSearchParamHybrid,
     KDTreeSearchParamKNN,
@@ -8,6 +9,7 @@ from open3d_mlx.geometry.kdtree import (
 from open3d_mlx.geometry.pointcloud import PointCloud
 
 __all__ = [
+    "AxisAlignedBoundingBox",
     "PointCloud",
     "KDTreeSearchParamKNN",
     "KDTreeSearchParamRadius",

@@ -580,10 +580,67 @@ class PointCloud:
     # Normals stubs (deferred to PRD-04)
     # ------------------------------------------------------------------
 
+    def crop(self, bounding_box) -> "PointCloud":
+        """Return new PointCloud with only points inside the bounding box.
+
+        Parameters
+        ----------
+        bounding_box : AxisAlignedBoundingBox
+            The bounding box to crop to.
+
+        Returns
+        -------
+        PointCloud
+        """
+        if self.is_empty():
+            return PointCloud()
+
+        pts_np = np.asarray(self.points, dtype=np.float32)
+        min_b = np.asarray(bounding_box.min_bound, dtype=np.float32)
+        max_b = np.asarray(bounding_box.max_bound, dtype=np.float32)
+        mask = np.all((pts_np >= min_b) & (pts_np <= max_b), axis=1)
+        return self.select_by_mask(mask)
+
+    def farthest_point_down_sample(self, num_samples: int) -> "PointCloud":
+        """Farthest point sampling -- greedily pick points maximizing min distance.
+
+        Parameters
+        ----------
+        num_samples : int
+            Number of points to select.
+
+        Returns
+        -------
+        PointCloud
+        """
+        if self.is_empty():
+            return PointCloud()
+
+        pts_np = np.asarray(self.points, dtype=np.float64)
+        N = len(pts_np)
+        num_samples = min(num_samples, N)
+        if num_samples <= 0:
+            return PointCloud()
+
+        selected = [0]
+        min_dists = np.full(N, np.inf)
+        for _ in range(num_samples - 1):
+            last = pts_np[selected[-1]]
+            dists = np.sum((pts_np - last) ** 2, axis=1)
+            min_dists = np.minimum(min_dists, dists)
+            selected.append(int(np.argmax(min_dists)))
+
+        return self.select_by_index(selected)
+
+    # ------------------------------------------------------------------
+    # Normals
+    # ------------------------------------------------------------------
+
     def estimate_normals(
         self,
         max_nn: int = 30,
         radius: float | None = None,
+        search_param=None,
     ) -> None:
         """Estimate normals using PCA on local neighbourhoods.
 
@@ -597,7 +654,25 @@ class PointCloud:
         radius : float or None
             If given, use hybrid search (radius + max_nn constraint).
             If None, use pure KNN search with k=max_nn.
+        search_param : KDTreeSearchParamKNN | KDTreeSearchParamRadius | KDTreeSearchParamHybrid | None
+            If given, overrides max_nn and radius for Open3D API compatibility.
         """
+        if search_param is not None:
+            from open3d_mlx.geometry.kdtree import (
+                KDTreeSearchParamHybrid,
+                KDTreeSearchParamKNN,
+                KDTreeSearchParamRadius,
+            )
+
+            if isinstance(search_param, KDTreeSearchParamHybrid):
+                max_nn = search_param.max_nn
+                radius = search_param.radius
+            elif isinstance(search_param, KDTreeSearchParamKNN):
+                max_nn = search_param.knn
+                radius = None
+            elif isinstance(search_param, KDTreeSearchParamRadius):
+                max_nn = 30
+                radius = search_param.radius
         if self.is_empty():
             return
 

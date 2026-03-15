@@ -12,12 +12,16 @@ import numpy as np
 
 from open3d_mlx.io.ply import read_ply, write_ply
 from open3d_mlx.io.pcd import read_pcd, write_pcd
+from open3d_mlx.io.xyz import read_xyz, write_xyz
+from open3d_mlx.io.pts import read_pts, write_pts
 
 # ── Format detection ────────────────────────────────────────────────────────
 
 _FORMAT_MAP = {
     ".ply": "ply",
     ".pcd": "pcd",
+    ".xyz": "xyz",
+    ".pts": "pts",
 }
 
 
@@ -133,8 +137,9 @@ def read_point_cloud(
     """Read a point cloud from file.
 
     Args:
-        filename: Path to .ply or .pcd file.
-        format: ``"auto"`` (detect from extension), ``"ply"``, or ``"pcd"``.
+        filename: Path to .ply, .pcd, .xyz, or .pts file.
+        format: ``"auto"`` (detect from extension), ``"ply"``, ``"pcd"``,
+            ``"xyz"``, or ``"pts"``.
         remove_nan_points: Remove vertices with NaN coordinates.
         remove_infinite_points: Remove vertices with Inf coordinates.
 
@@ -149,6 +154,10 @@ def read_point_cloud(
         data = read_ply(filename)
     elif fmt == "pcd":
         data = read_pcd(filename)
+    elif fmt == "xyz":
+        data = read_xyz(filename)
+    elif fmt == "pts":
+        data = read_pts(filename)
     else:
         raise ValueError(f"Unknown point cloud format: {fmt}")
 
@@ -183,6 +192,10 @@ def write_point_cloud(
         write_ply(filename, data, ascii=write_ascii)
     elif fmt == "pcd":
         write_pcd(filename, data, ascii=write_ascii)
+    elif fmt == "xyz":
+        write_xyz(filename, data)
+    elif fmt == "pts":
+        write_pts(filename, data)
     else:
         raise ValueError(f"Unknown point cloud format: {fmt}")
 

@@ -22,6 +22,8 @@ from open3d_mlx.pipelines.registration.convergence import ICPConvergenceCriteria
 from open3d_mlx.pipelines.registration.correspondence import find_correspondences
 from open3d_mlx.pipelines.registration.result import RegistrationResult
 from open3d_mlx.pipelines.registration.transformation import (
+    TransformationEstimationForColoredICP,
+    TransformationEstimationForGeneralizedICP,
     TransformationEstimationPointToPlane,
     TransformationEstimationPointToPoint,
 )
@@ -79,6 +81,23 @@ def registration_icp(
     is_point_to_plane = isinstance(
         estimation_method, TransformationEstimationPointToPlane
     )
+    is_colored = isinstance(
+        estimation_method, TransformationEstimationForColoredICP
+    )
+    is_gicp = isinstance(
+        estimation_method, TransformationEstimationForGeneralizedICP
+    )
+
+    if is_colored:
+        if not source.has_colors() or not target.has_colors():
+            raise ValueError(
+                "Colored ICP requires both source and target to have colors."
+            )
+        if not target.has_normals():
+            raise ValueError(
+                "Colored ICP requires target normals. "
+                "Call target.estimate_normals() first."
+            )
 
     if is_point_to_plane and not target.has_normals():
         raise ValueError(
@@ -173,11 +192,26 @@ def registration_icp(
         prev_rmse = rmse
 
         # 4. Estimate incremental transformation
-        if is_point_to_plane:
+        if is_colored:
+            T_step = estimation_method.compute_transformation(
+                source_transformed.points,
+                tgt.points,
+                source_transformed.colors,
+                tgt.colors,
+                tgt.normals,
+                correspondences,
+            )
+        elif is_point_to_plane:
             T_step = estimation_method.compute_transformation(
                 source_transformed.points,
                 tgt.points,
                 tgt.normals,
+                correspondences,
+            )
+        elif is_gicp:
+            T_step = estimation_method.compute_transformation(
+                source_transformed.points,
+                tgt.points,
                 correspondences,
             )
         else:
@@ -307,3 +341,110 @@ def evaluate_registration(
         num_iterations=0,
         converged=False,
     )
+
+
+def multi_scale_icp(
+    source: PointCloud,
+    target: PointCloud,
+    voxel_sizes: list[float],
+    max_correspondence_distances: list[float],
+    criteria_list: Optional[list[ICPConvergenceCriteria]] = None,
+    init_source_to_target: Optional[mx.array] = None,
+    estimation_method: Optional[
+        Union[
+            TransformationEstimationPointToPoint,
+            TransformationEstimationPointToPlane,
+            TransformationEstimationForColoredICP,
+            TransformationEstimationForGeneralizedICP,
+        ]
+    ] = None,
+) -> RegistrationResult:
+    """Coarse-to-fine multi-scale ICP registration.
+
+    Runs ICP at each scale (from coarse to fine), using the result of each
+    scale as the initial transformation for the next finer scale.
+
+    Parameters
+    ----------
+    source : PointCloud
+        Source point cloud.
+    target : PointCloud
+        Target point cloud.
+    voxel_sizes : list[float]
+        Voxel sizes for each scale level (coarse to fine).
+    max_correspondence_distances : list[float]
+        Max correspondence distance at each scale.
+    criteria_list : list[ICPConvergenceCriteria] or None
+        Convergence criteria per scale.  If ``None``, defaults are used.
+    init_source_to_target : mx.array or None
+        Initial ``(4, 4)`` transformation.  Defaults to identity.
+    estimation_method : estimation class or None
+        Transformation estimation method.  Defaults to point-to-point.
+
+    Returns
+    -------
+    RegistrationResult
+        Result from the finest scale.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_sizes`` and ``max_correspondence_distances`` have
+        different lengths.
+    """
+    if len(voxel_sizes) != len(max_correspondence_distances):
+        raise ValueError(
+            f"voxel_sizes ({len(voxel_sizes)}) and "
+            f"max_correspondence_distances ({len(max_correspondence_distances)}) "
+            f"must have the same length."
+        )
+
+    if estimation_method is None:
+        estimation_method = TransformationEstimationPointToPoint()
+
+    needs_normals = isinstance(
+        estimation_method,
+        (TransformationEstimationPointToPlane, TransformationEstimationForColoredICP),
+    )
+
+    T = init_source_to_target if init_source_to_target is not None else mx.eye(4, dtype=mx.float32)
+    result = None
+
+    for i in range(len(voxel_sizes)):
+        vs = voxel_sizes[i]
+        max_dist = max_correspondence_distances[i]
+        crit = criteria_list[i] if criteria_list is not None else None
+
+        # Downsample
+        src_down = source.voxel_down_sample(vs)
+        tgt_down = target.voxel_down_sample(vs)
+
+        # Estimate normals if needed
+        if needs_normals:
+            if not tgt_down.has_normals():
+                tgt_down.estimate_normals()
+            if not src_down.has_normals():
+                src_down.estimate_normals()
+
+        result = registration_icp(
+            src_down,
+            tgt_down,
+            max_correspondence_distance=max_dist,
+            init_source_to_target=T,
+            estimation_method=estimation_method,
+            criteria=crit,
+        )
+        T = result.transformation
+
+    # If no scales were provided, return identity result
+    if result is None:
+        return RegistrationResult(
+            transformation=T,
+            fitness=0.0,
+            inlier_rmse=float("inf"),
+            correspondences=None,
+            num_iterations=0,
+            converged=False,
+        )
+
+    return result

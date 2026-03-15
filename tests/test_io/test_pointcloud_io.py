@@ -30,7 +30,7 @@ class TestAutoDetect:
         assert pts.shape == (8, 3)
 
     def test_unsupported_extension(self, data_dir):
-        path = data_dir / "test.xyz"
+        path = data_dir / "test.obj"
         path.write_text("dummy")
         with pytest.raises(ValueError, match="Unsupported"):
             read_point_cloud(str(path))
@@ -41,6 +41,30 @@ class TestAutoDetect:
             assert result["points"].shape == (8, 3)
         else:
             assert np.array(result.points).shape == (8, 3)
+
+
+    def test_detect_xyz(self, data_dir):
+        path = data_dir / "test.xyz"
+        np.savetxt(path, CUBE_POINTS, fmt="%.6f")
+        result = read_point_cloud(str(path))
+        if isinstance(result, dict):
+            pts = result["points"]
+        else:
+            pts = np.array(result.points)
+        assert pts.shape == (8, 3)
+
+    def test_detect_pts(self, data_dir):
+        path = data_dir / "test.pts"
+        with open(path, "w") as f:
+            f.write(f"{len(CUBE_POINTS)}\n")
+            for p in CUBE_POINTS:
+                f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+        result = read_point_cloud(str(path))
+        if isinstance(result, dict):
+            pts = result["points"]
+        else:
+            pts = np.array(result.points)
+        assert pts.shape == (8, 3)
 
 
 class TestRemoveNonFinite:
@@ -157,6 +181,32 @@ class TestRoundtrip:
                 else:
                     np.testing.assert_array_equal(colors, CUBE_COLORS_UINT8)
 
+    def test_roundtrip_xyz(self, data_dir):
+        data = {"points": CUBE_POINTS.copy()}
+        path = data_dir / "roundtrip.xyz"
+        write_point_cloud(str(path), data)
+
+        result = read_point_cloud(str(path))
+        if isinstance(result, dict):
+            np.testing.assert_allclose(result["points"], CUBE_POINTS, atol=1e-5)
+        else:
+            np.testing.assert_allclose(
+                np.array(result.points), CUBE_POINTS, atol=1e-5
+            )
+
+    def test_roundtrip_pts(self, data_dir):
+        data = {"points": CUBE_POINTS.copy()}
+        path = data_dir / "roundtrip.pts"
+        write_point_cloud(str(path), data)
+
+        result = read_point_cloud(str(path))
+        if isinstance(result, dict):
+            np.testing.assert_allclose(result["points"], CUBE_POINTS, atol=1e-5)
+        else:
+            np.testing.assert_allclose(
+                np.array(result.points), CUBE_POINTS, atol=1e-5
+            )
+
     def test_empty_roundtrip_ply(self, data_dir):
         data = {"points": np.empty((0, 3), dtype=np.float32)}
         path = data_dir / "empty.ply"
@@ -178,6 +228,6 @@ class TestWritePointCloud:
 
     def test_unsupported_format(self, data_dir):
         data = {"points": CUBE_POINTS.copy()}
-        path = data_dir / "bad.xyz"
+        path = data_dir / "bad.obj"
         with pytest.raises(ValueError, match="Unsupported"):
             write_point_cloud(str(path), data)
