@@ -51,6 +51,8 @@ include = ["open3d_mlx*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --tb=short"
+# Allow pytest to discover bench_*.py files in benchmarks/
+python_files = ["test_*.py", "bench_*.py"]
 
 [tool.ruff]
 target-version = "py310"
