@@ -518,9 +518,16 @@ def _deduplicate_vertices(
         return vertices, triangles
 
     rounded = np.round(vertices, decimals=decimals)
-    _, inverse_indices, unique_indices = np.unique(
-        rounded, axis=0, return_inverse=True, return_index=True
+    unique_rounded, inverse_indices = np.unique(
+        rounded, axis=0, return_inverse=True,
     )
-    unique_vertices = vertices[unique_indices]
+    # Build unique vertices by averaging all vertices that map to same unique
+    unique_vertices = np.zeros((len(unique_rounded), 3), dtype=np.float64)
+    counts = np.zeros(len(unique_rounded), dtype=np.int32)
+    for i, idx in enumerate(inverse_indices):
+        unique_vertices[idx] += vertices[i]
+        counts[idx] += 1
+    unique_vertices /= counts[:, None]
+
     remapped_triangles = inverse_indices[triangles]
     return unique_vertices.astype(np.float32), remapped_triangles.astype(np.int32)
