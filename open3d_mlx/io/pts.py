@@ -47,7 +47,7 @@ def read_pts(filepath: str | Path) -> dict[str, np.ndarray]:
     # Format: x y z intensity r g b  (7 columns)
     if data.shape[1] >= 7:
         colors = data[:, 4:7]
-        if colors.max() > 1.0:
+        if colors.max() > 2.0:  # Clearly uint8 range, not edge-case floats
             colors = colors / 255.0
         result["colors"] = colors.astype(np.float32)
 
@@ -76,9 +76,20 @@ def write_pts(
 
     with open(filepath, "w") as f:
         f.write(f"{len(pts)}\n")
-        for i in range(len(pts)):
-            line = f"{pts[i, 0]:.6f} {pts[i, 1]:.6f} {pts[i, 2]:.6f}"
-            if has_colors:
-                c = (data["colors"][i] * 255).astype(np.uint8)
-                line += f" 0 {c[0]} {c[1]} {c[2]}"
-            f.write(line + "\n")
+        if has_colors:
+            colors_u8 = np.clip(data["colors"] * 255, 0, 255).astype(np.uint8)
+            intensity = np.zeros((len(pts), 1), dtype=np.uint8)
+            # Build: x y z intensity r g b
+            lines = []
+            float_fmt = "%.6f %.6f %.6f"
+            for i in range(len(pts)):
+                fpart = float_fmt % (pts[i, 0], pts[i, 1], pts[i, 2])
+                lines.append(
+                    f"{fpart} 0 {colors_u8[i, 0]} {colors_u8[i, 1]} {colors_u8[i, 2]}"
+                )
+            f.write("\n".join(lines) + "\n")
+        else:
+            import io as _io
+            buf = _io.StringIO()
+            np.savetxt(buf, pts, fmt="%.6f", delimiter=" ")
+            f.write(buf.getvalue())

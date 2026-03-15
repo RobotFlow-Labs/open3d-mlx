@@ -1,7 +1,9 @@
 """Linear algebra utilities for 3D geometry operations.
 
-Provides cross product, batched SVD, and batched linear solve with
-numpy fallbacks for operations not natively supported in MLX.
+Provides cross product, batched SVD, and batched linear solve.
+Uses MLX-native operations where available, with numpy fallbacks
+for operations that benefit from its robustness (e.g. singular
+matrix handling in batched solve).
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ import mlx.core as mx
 
 def compute_cross_product(a: mx.array, b: mx.array) -> mx.array:
     """Compute element-wise cross product of two (N, 3) arrays.
+
+    Runs entirely on GPU via MLX.
 
     Args:
         a: (N, 3) or (3,) first vectors.
@@ -43,6 +47,9 @@ def batched_svd(
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Batched SVD decomposition.
 
+    Tries MLX-native SVD first (GPU). Falls back to numpy batched SVD
+    which handles (N, M, K) natively without per-matrix loops.
+
     Args:
         matrices: (B, M, N) batch of matrices.
 
@@ -51,16 +58,16 @@ def batched_svd(
         S: (B, min(M,N)) singular values.
         Vt: (B, min(M,N), N) right singular vectors (transposed).
     """
-    # Try MLX native first
+    # Try MLX native first (runs on GPU)
     try:
         U, S, Vt = mx.linalg.svd(matrices)
         return U, S, Vt
     except Exception:
         pass
 
-    # Fallback to numpy
-    matrices_np = np.array(matrices, dtype=np.float64)
-    U_np, S_np, Vt_np = np.linalg.svd(matrices_np, full_matrices=False)
+    # Fallback: numpy batched SVD (handles (B, M, N) natively, no loops)
+    np_matrices = np.array(matrices, dtype=np.float64)
+    U_np, S_np, Vt_np = np.linalg.svd(np_matrices, full_matrices=False)
     return (
         mx.array(U_np.astype(np.float32)),
         mx.array(S_np.astype(np.float32)),
@@ -73,6 +80,9 @@ def batched_solve(
 ) -> mx.array:
     """Solve batched linear systems A @ x = b.
 
+    Uses numpy's vectorized solve which handles (B, N, N) natively.
+    Falls back to lstsq for singular matrices.
+
     Args:
         A: (B, N, N) batch of square matrices.
         b: (B, N) or (B, N, K) right-hand sides.
@@ -80,29 +90,20 @@ def batched_solve(
     Returns:
         x: same shape as b, solutions.
     """
-    # Fallback to numpy for reliable batched solve
     A_np = np.array(A, dtype=np.float64)
     b_np = np.array(b, dtype=np.float64)
 
-    if b_np.ndim == 2:
-        # (B, N) -> solve each independently
+    try:
+        x_np = np.linalg.solve(A_np, b_np)
+    except np.linalg.LinAlgError:
+        # Some matrices are singular — fall back to per-matrix lstsq
         B = A_np.shape[0]
         x_np = np.zeros_like(b_np)
         for i in range(B):
             try:
                 x_np[i] = np.linalg.solve(A_np[i], b_np[i])
             except np.linalg.LinAlgError:
-                # Singular matrix: use least-squares
-                x_np[i], _, _, _ = np.linalg.lstsq(A_np[i], b_np[i], rcond=None)
-    else:
-        # (B, N, K)
-        B = A_np.shape[0]
-        x_np = np.zeros_like(b_np)
-        for i in range(B):
-            try:
-                x_np[i] = np.linalg.solve(A_np[i], b_np[i])
-            except np.linalg.LinAlgError:
-                x_np[i], _, _, _ = np.linalg.lstsq(A_np[i], b_np[i], rcond=None)
+                x_np[i] = np.linalg.lstsq(A_np[i], b_np[i], rcond=None)[0]
 
     return mx.array(x_np.astype(np.float32))
 
@@ -112,6 +113,9 @@ def symmetric_eigendecomposition(
 ) -> tuple[mx.array, mx.array]:
     """Eigendecomposition of symmetric matrices.
 
+    Uses numpy's vectorized eigh which handles (B, N, N) natively
+    without per-matrix loops.
+
     Args:
         matrices: (B, N, N) batch of symmetric matrices.
 
@@ -120,16 +124,9 @@ def symmetric_eigendecomposition(
         eigenvectors: (B, N, N) columns are eigenvectors.
     """
     mat_np = np.array(matrices, dtype=np.float64)
-    B = mat_np.shape[0]
-    N = mat_np.shape[1]
 
-    eigenvalues = np.zeros((B, N), dtype=np.float64)
-    eigenvectors = np.zeros((B, N, N), dtype=np.float64)
-
-    for i in range(B):
-        w, v = np.linalg.eigh(mat_np[i])
-        eigenvalues[i] = w
-        eigenvectors[i] = v
+    # numpy.linalg.eigh handles batched (B, N, N) natively
+    eigenvalues, eigenvectors = np.linalg.eigh(mat_np)
 
     return (
         mx.array(eigenvalues.astype(np.float32)),

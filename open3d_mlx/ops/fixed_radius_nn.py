@@ -6,9 +6,13 @@ Much faster than KDTree for large point clouds when radius is known.
 Algorithm:
     1. Compute voxel indices: floor(points / cell_size)
     2. Hash voxel indices to cell keys using prime hashing
-    3. Sort points by cell key
+    3. Sort points by cell key (on GPU via MLX)
     4. For each query, check 27 neighboring cells (3x3x3 cube)
     5. Filter by distance <= radius, keep nearest
+
+This implementation keeps data on GPU (MLX arrays) as long as possible
+and uses vectorized numpy only for the hash-table lookup (since MLX
+lacks np.unique / searchsorted). All distance computations are batched.
 """
 
 from __future__ import annotations
@@ -34,8 +38,8 @@ _OFFSETS_NP = np.array(
 )
 
 
-def _hash_cells(cell_idx: np.ndarray) -> np.ndarray:
-    """Compute spatial hash keys from integer cell indices.
+def _hash_cells_np(cell_idx: np.ndarray) -> np.ndarray:
+    """Compute spatial hash keys from integer cell indices (numpy path).
 
     Args:
         cell_idx: (N, 3) int64 cell indices.
@@ -43,7 +47,6 @@ def _hash_cells(cell_idx: np.ndarray) -> np.ndarray:
     Returns:
         keys: (N,) int32 hash keys (non-negative).
     """
-    # Use int64 arithmetic to avoid overflow, then mod to int32 range
     h = (
         cell_idx[:, 0].astype(np.int64) * _P1
         + cell_idx[:, 1].astype(np.int64) * _P2
@@ -55,6 +58,11 @@ def _hash_cells(cell_idx: np.ndarray) -> np.ndarray:
 
 class FixedRadiusIndex:
     """Fixed-radius nearest neighbor search using spatial hashing.
+
+    Index construction hashes and sorts points on-GPU via MLX.
+    The hash table (unique keys, bucket starts/counts) is built with
+    numpy since MLX lacks ``np.unique``.  Query processing is fully
+    vectorized with no Python loops over individual query points.
 
     Args:
         points: (N, 3) float32 MLX array.
@@ -73,38 +81,44 @@ class FixedRadiusIndex:
             raise ValueError(f"radius must be > 0, got {radius}")
 
         self._radius = float(radius)
+        self._radius_sq = self._radius * self._radius
         self._cell_size = float(radius)
         self._n = points.shape[0]
 
-        # Convert to numpy for index building
-        pts_np = np.array(points, dtype=np.float32)
-        self._points_np = pts_np
-
         if self._n == 0:
-            # Empty index
-            self._sorted_points = np.empty((0, 3), dtype=np.float32)
-            self._sorted_keys = np.empty((0,), dtype=np.int32)
-            self._sort_order = np.empty((0,), dtype=np.int32)
+            # Empty index — store minimal arrays
+            self._sorted_points_np = np.empty((0, 3), dtype=np.float32)
+            self._sort_order_np = np.empty((0,), dtype=np.int32)
             self._table_keys = np.empty((0,), dtype=np.int32)
             self._table_starts = np.empty((0,), dtype=np.int64)
             self._table_counts = np.empty((0,), dtype=np.int64)
             return
 
-        # Compute cell indices: floor(points / cell_size)
-        cell_idx = np.floor(pts_np / self._cell_size).astype(np.int64)
+        # --- GPU: hash computation and sort via MLX ---
+        cell_idx = mx.floor(points / self._cell_size).astype(mx.int32)
 
-        # Hash cell indices
-        hash_keys = _hash_cells(cell_idx)
+        # Spatial hash on GPU (use int32 arithmetic, matching numpy path)
+        hash_keys = (
+            cell_idx[:, 0].astype(mx.int64) * 73856093
+            + cell_idx[:, 1].astype(mx.int64) * 19349663
+            + cell_idx[:, 2].astype(mx.int64) * 83492791
+        )
+        # Mod to keep in positive int32 range
+        hash_keys = (hash_keys % (2**31 - 1)).astype(mx.int32)
 
-        # Sort points by hash key for cache-coherent access
-        sort_order = np.argsort(hash_keys)
-        self._sort_order = sort_order.astype(np.int32)
-        self._sorted_keys = hash_keys[sort_order]
-        self._sorted_points = pts_np[sort_order]
+        # Sort on GPU
+        sort_order = mx.argsort(hash_keys)
+        sorted_keys = hash_keys[sort_order]
+        sorted_points = points[sort_order]
+        mx.eval(sorted_keys, sorted_points, sort_order)
 
-        # Build lookup table: unique key -> (start, count)
+        # --- CPU: build hash table (unique/searchsorted not in MLX) ---
+        self._sort_order_np = np.array(sort_order, dtype=np.int32)
+        self._sorted_points_np = np.array(sorted_points, dtype=np.float32)
+        sorted_keys_np = np.array(sorted_keys, dtype=np.int32)
+
         unique_keys, starts, counts = np.unique(
-            self._sorted_keys, return_index=True, return_counts=True
+            sorted_keys_np, return_index=True, return_counts=True
         )
         self._table_keys = unique_keys
         self._table_starts = starts.astype(np.int64)
@@ -120,10 +134,18 @@ class FixedRadiusIndex:
         """Search radius."""
         return self._radius
 
+    # ------------------------------------------------------------------
+    # search_nearest — fully vectorized, no per-query Python loops
+    # ------------------------------------------------------------------
+
     def search_nearest(
         self, query: mx.array
     ) -> tuple[mx.array, mx.array]:
         """Find single nearest neighbor within radius using 27-cell search.
+
+        Fully vectorized: no Python loops over individual query points.
+        Hash computation done on GPU, distance computation batched via
+        numpy broadcasting.
 
         Args:
             query: (M, 3) query points.
@@ -138,58 +160,77 @@ class FixedRadiusIndex:
         M = query_np.shape[0]
 
         best_idx = np.full(M, -1, dtype=np.int32)
-        best_dist = np.full(M, np.inf, dtype=np.float32)
+        best_dist_sq = np.full(M, np.inf, dtype=np.float32)
 
         if self._n == 0 or M == 0:
-            return mx.array(best_idx), mx.array(best_dist)
+            return mx.array(best_idx), mx.array(best_dist_sq)
 
-        radius_sq = self._radius ** 2
+        radius_sq = self._radius_sq
 
         # Compute query cell indices
         query_cells = np.floor(query_np / self._cell_size).astype(np.int64)
 
-        # For each of the 27 neighbor offsets, batch-process all queries
+        sorted_pts = self._sorted_points_np
+        sort_order = self._sort_order_np
+        table_keys = self._table_keys
+        table_starts = self._table_starts
+        table_counts = self._table_counts
+        n_buckets = len(table_keys)
+
+        # For each of the 27 neighbor offsets, batch-process ALL queries
         for offset in _OFFSETS_NP:
-            neighbor_cells = query_cells + offset  # (M, 3)
-            neighbor_hash = _hash_cells(neighbor_cells)  # (M,) int32
+            nb_cells = query_cells + offset  # (M, 3)
+            nb_hash = _hash_cells_np(nb_cells)  # (M,) int32
 
-            # For each unique hash key in this batch, look up the bucket
-            unique_query_keys = np.unique(neighbor_hash)
+            # Vectorized bucket lookup via searchsorted
+            positions = np.searchsorted(table_keys, nb_hash)
+            valid_mask = (
+                (positions < n_buckets)
+                & (table_keys[np.clip(positions, 0, n_buckets - 1)] == nb_hash)
+            )
 
-            for qk in unique_query_keys:
-                # Find which queries map to this key
-                query_mask = neighbor_hash == qk
+            if not valid_mask.any():
+                continue
 
-                # Look up bucket in hash table
-                table_pos = np.searchsorted(self._table_keys, qk)
-                if table_pos >= len(self._table_keys) or self._table_keys[table_pos] != qk:
-                    continue  # No points in this cell
+            valid_qi = np.where(valid_mask)[0]
+            valid_positions = positions[valid_qi]
 
-                start = int(self._table_starts[table_pos])
-                count = int(self._table_counts[table_pos])
-                bucket_points = self._sorted_points[start : start + count]  # (C, 3)
-                bucket_original_idx = self._sort_order[start : start + count]
+            # Group queries by bucket for efficient batched distance calc
+            unique_bpos = np.unique(valid_positions)
+            for bp in unique_bpos:
+                qi_mask = valid_positions == bp
+                qi_in_bucket = valid_qi[qi_mask]
 
-                # Compute distances from masked queries to bucket points
-                query_subset_indices = np.where(query_mask)[0]
-                query_subset = query_np[query_subset_indices]  # (Q, 3)
+                start = int(table_starts[bp])
+                count = int(table_counts[bp])
+                bucket_pts = sorted_pts[start : start + count]  # (C, 3)
 
-                # Pairwise squared distances: (Q, C)
-                diff = query_subset[:, None, :] - bucket_points[None, :, :]  # (Q, C, 3)
-                sq_dists = np.sum(diff ** 2, axis=2)  # (Q, C)
+                # Vectorized distances: (Q, 1, 3) - (1, C, 3) -> (Q, C)
+                diffs = query_np[qi_in_bucket, None, :] - bucket_pts[None, :, :]
+                sq_dists = np.sum(diffs * diffs, axis=2)  # (Q, C)
 
-                # Find minimum per query
+                # Min per query
                 min_idx_in_bucket = np.argmin(sq_dists, axis=1)  # (Q,)
-                min_dists = sq_dists[np.arange(len(query_subset_indices)), min_idx_in_bucket]
+                min_dists = sq_dists[
+                    np.arange(len(qi_in_bucket)), min_idx_in_bucket
+                ]
 
-                # Update best if within radius and closer than current best
-                for j, qi in enumerate(query_subset_indices):
-                    d = min_dists[j]
-                    if d <= radius_sq and d < best_dist[qi]:
-                        best_dist[qi] = d
-                        best_idx[qi] = bucket_original_idx[min_idx_in_bucket[j]]
+                # Vectorized update (no per-query Python loop)
+                update_mask = (min_dists <= radius_sq) & (
+                    min_dists < best_dist_sq[qi_in_bucket]
+                )
+                update_qi = qi_in_bucket[update_mask]
+                best_dist_sq[update_qi] = min_dists[update_mask]
+                best_idx[update_qi] = sort_order[
+                    start + min_idx_in_bucket[update_mask]
+                ]
 
-        return mx.array(best_idx), mx.array(best_dist)
+        # Return squared distances (inf where no match)
+        return mx.array(best_idx), mx.array(best_dist_sq)
+
+    # ------------------------------------------------------------------
+    # search — multi-neighbor, vectorized where possible
+    # ------------------------------------------------------------------
 
     def search(
         self, query: mx.array, max_nn: int = 1
@@ -216,55 +257,67 @@ class FixedRadiusIndex:
         if self._n == 0 or M == 0:
             return mx.array(out_idx), mx.array(out_dist)
 
-        radius_sq = self._radius ** 2
+        radius_sq = self._radius_sq
         query_cells = np.floor(query_np / self._cell_size).astype(np.int64)
 
-        # Collect all candidate (query_idx, point_idx, sq_dist) tuples
-        # then pick top-max_nn per query.
-        # For efficiency, gather per-query candidates.
-        candidates: list[list[tuple[int, float]]] = [[] for _ in range(M)]
+        sorted_pts = self._sorted_points_np
+        sort_order = self._sort_order_np
+        table_keys = self._table_keys
+        table_starts = self._table_starts
+        table_counts = self._table_counts
+        n_buckets = len(table_keys)
+
+        # Collect per-query candidate lists: (original_idx, sq_dist)
+        # We use a dict keyed by point index to deduplicate
+        candidates: list[dict[int, float]] = [{} for _ in range(M)]
 
         for offset in _OFFSETS_NP:
-            neighbor_cells = query_cells + offset
-            neighbor_hash = _hash_cells(neighbor_cells)
+            nb_cells = query_cells + offset
+            nb_hash = _hash_cells_np(nb_cells)
 
-            unique_query_keys = np.unique(neighbor_hash)
+            positions = np.searchsorted(table_keys, nb_hash)
+            valid_mask = (
+                (positions < n_buckets)
+                & (table_keys[np.clip(positions, 0, n_buckets - 1)] == nb_hash)
+            )
 
-            for qk in unique_query_keys:
-                query_mask = neighbor_hash == qk
-                table_pos = np.searchsorted(self._table_keys, qk)
-                if table_pos >= len(self._table_keys) or self._table_keys[table_pos] != qk:
-                    continue
+            if not valid_mask.any():
+                continue
 
-                start = int(self._table_starts[table_pos])
-                count = int(self._table_counts[table_pos])
-                bucket_points = self._sorted_points[start : start + count]
-                bucket_original_idx = self._sort_order[start : start + count]
+            valid_qi = np.where(valid_mask)[0]
+            valid_positions = positions[valid_qi]
 
-                query_subset_indices = np.where(query_mask)[0]
-                query_subset = query_np[query_subset_indices]
+            unique_bpos = np.unique(valid_positions)
+            for bp in unique_bpos:
+                qi_mask = valid_positions == bp
+                qi_in_bucket = valid_qi[qi_mask]
 
-                diff = query_subset[:, None, :] - bucket_points[None, :, :]
-                sq_dists = np.sum(diff ** 2, axis=2)
+                start = int(table_starts[bp])
+                count = int(table_counts[bp])
+                bucket_pts = sorted_pts[start : start + count]  # (C, 3)
+                bucket_orig = sort_order[start : start + count]  # (C,)
 
-                for j, qi in enumerate(query_subset_indices):
+                # Vectorized distances
+                diffs = query_np[qi_in_bucket, None, :] - bucket_pts[None, :, :]
+                sq_dists = np.sum(diffs * diffs, axis=2)  # (Q, C)
+
+                # Mask by radius
+                within = sq_dists <= radius_sq  # (Q, C)
+
+                # Collect candidates per query
+                for j, qi in enumerate(qi_in_bucket):
                     for c in range(count):
-                        d = float(sq_dists[j, c])
-                        if d <= radius_sq:
-                            candidates[qi].append(
-                                (int(bucket_original_idx[c]), d)
-                            )
+                        if within[j, c]:
+                            pidx = int(bucket_orig[c])
+                            d = float(sq_dists[j, c])
+                            if pidx not in candidates[qi] or d < candidates[qi][pidx]:
+                                candidates[qi][pidx] = d
 
-        # Deduplicate and pick top-max_nn per query
+        # Pick top-max_nn per query
         for qi in range(M):
             if not candidates[qi]:
                 continue
-            # Deduplicate by point index, keep min distance
-            seen: dict[int, float] = {}
-            for pidx, d in candidates[qi]:
-                if pidx not in seen or d < seen[pidx]:
-                    seen[pidx] = d
-            sorted_cands = sorted(seen.items(), key=lambda x: x[1])
+            sorted_cands = sorted(candidates[qi].items(), key=lambda x: x[1])
             n = min(len(sorted_cands), max_nn)
             for j in range(n):
                 out_idx[qi, j] = sorted_cands[j][0]

@@ -2,12 +2,14 @@
 
 Matches Open3D: o3d.pipelines.integration.UniformTSDFVolume
 
-The implementation uses NumPy for the integration inner loop to maintain
-float64 precision in the geometric transforms, and converts to MLX arrays
-at the public property boundary.
+The implementation uses MLX for GPU-accelerated computation in the integration
+inner loop (matrix transforms, SDF computation, weighted average updates),
+with numpy used only for depth image sampling (2D gather) which MLX lacks.
 """
 
 from __future__ import annotations
+
+import warnings
 
 import mlx.core as mx
 import numpy as np
@@ -41,6 +43,14 @@ class UniformTSDFVolume:
         color: bool = False,
         origin=None,
     ):
+        if resolution > 256:
+            warnings.warn(
+                f"Resolution {resolution}^3 requires "
+                f"{resolution**3 * 8 / 1e9:.1f}GB. "
+                f"Consider ScalableTSDFVolume for large scenes.",
+                stacklevel=2,
+            )
+
         self.length = float(length)
         self.resolution = int(resolution)
         self.voxel_size = self.length / self.resolution
@@ -58,7 +68,7 @@ class UniformTSDFVolume:
         self._color: np.ndarray | None = (
             np.zeros((R, R, R, 3), dtype=np.float32) if color else None
         )
-        self._voxel_centers: np.ndarray | None = None  # lazy cache
+        self._voxel_centers_mx: mx.array | None = None  # lazy cache (MLX)
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -74,20 +84,22 @@ class UniformTSDFVolume:
         # Keep voxel_centers cache
 
     # ------------------------------------------------------------------
-    # Vectorised integration
+    # Vectorised integration (MLX GPU-accelerated)
     # ------------------------------------------------------------------
 
     def _ensure_voxel_centers(self) -> None:
-        """Lazily compute and cache voxel centre positions."""
-        if self._voxel_centers is not None:
+        """Lazily compute and cache voxel centre positions as MLX array."""
+        if self._voxel_centers_mx is not None:
             return
         R = self.resolution
         coords = np.arange(R, dtype=np.float32)
         gi, gj, gk = np.meshgrid(coords, coords, coords, indexing="ij")
         centers = np.stack([gi, gj, gk], axis=-1).reshape(-1, 3)
-        self._voxel_centers = (
-            (centers + 0.5) * self.voxel_size + self.origin.astype(np.float32)
+        centers_world = (centers + 0.5) * self.voxel_size + self.origin.astype(
+            np.float32
         )
+        self._voxel_centers_mx = mx.array(centers_world)
+        mx.eval(self._voxel_centers_mx)
 
     def integrate(
         self,
@@ -99,6 +111,10 @@ class UniformTSDFVolume:
         color=None,
     ) -> None:
         """Integrate a single depth frame into the volume.
+
+        Uses MLX for GPU-accelerated matrix transforms, SDF computation,
+        and weighted average updates. Only the depth image sampling step
+        falls back to numpy (MLX lacks 2D gather/indexing).
 
         Parameters
         ----------
@@ -118,63 +134,94 @@ class UniformTSDFVolume:
         R = self.resolution
         self._ensure_voxel_centers()
 
-        # --- all computation in numpy for precision ---
-        voxels = self._voxel_centers  # (R^3, 3) float32
+        # --- MLX GPU: transform voxel centres to camera frame ---
+        voxels = self._voxel_centers_mx  # (R^3, 3) MLX array on GPU
 
-        ext = np.asarray(extrinsic, dtype=np.float64)
-        Rot = ext[:3, :3]
-        tvec = ext[:3, 3]
+        ext = mx.array(np.asarray(extrinsic, dtype=np.float32))
+        Rot = ext[:3, :3]  # (3, 3)
+        tvec = ext[:3, 3]  # (3,)
 
-        # Transform voxel centres to camera frame
-        cam = (voxels @ Rot.T + tvec).astype(np.float32)  # (R^3, 3)
-        z = cam[:, 2]
+        # GPU matmul: transform all voxel centres to camera frame
+        cam = voxels @ Rot.T + tvec  # (R^3, 3)
 
-        # Project to pixel coordinates
-        u = cam[:, 0] / z * intrinsic.fx + intrinsic.cx
-        v = cam[:, 1] / z * intrinsic.fy + intrinsic.cy
+        z = cam[:, 2]  # (R^3,)
+
+        # Project to pixel coordinates — MLX GPU
+        fx = mx.array(intrinsic.fx, dtype=mx.float32)
+        fy = mx.array(intrinsic.fy, dtype=mx.float32)
+        cx = mx.array(intrinsic.cx, dtype=mx.float32)
+        cy = mx.array(intrinsic.cy, dtype=mx.float32)
+
+        u = cam[:, 0] / z * fx + cx
+        v = cam[:, 1] / z * fy + cy
 
         H, W = intrinsic.height, intrinsic.width
 
-        # Validity mask
-        valid = (z > 0) & (u >= 0) & (u < W - 1) & (v >= 0) & (v < H - 1)
-
-        # Sample depth at projected pixel (nearest-neighbour)
-        ui = np.clip(u.astype(np.int32), 0, W - 1)
-        vi = np.clip(v.astype(np.int32), 0, H - 1)
-
-        depth_np = np.asarray(depth, dtype=np.float32) / depth_scale
-        sampled = depth_np[vi, ui]  # (R^3,)
-
-        # SDF
-        sdf = sampled - z
-        valid &= (sampled > 0) & (sampled < depth_max) & (np.abs(sdf) < self.sdf_trunc)
-        tsdf_val = np.clip(sdf / self.sdf_trunc, -1.0, 1.0)
-
-        # Weighted average update
-        tsdf_flat = self._tsdf.reshape(-1)
-        w_flat = self._weight.reshape(-1)
-
-        w_new = np.where(valid, w_flat + 1.0, w_flat)
-        t_new = np.where(
-            valid,
-            (tsdf_flat * w_flat + tsdf_val) / np.maximum(w_new, 1.0),
-            tsdf_flat,
+        # Validity mask — MLX GPU
+        valid = (
+            (z > 0)
+            & (u >= 0)
+            & (u < W - 1)
+            & (v >= 0)
+            & (v < H - 1)
         )
 
-        self._tsdf = t_new.reshape(R, R, R)
-        self._weight = np.minimum(w_new, 255.0).reshape(R, R, R)
+        # --- Depth sampling: numpy (MLX lacks 2D gather) ---
+        # Materialize pixel coords and validity for indexing
+        mx.eval(u, v, valid, z)
+        u_np = np.array(u).astype(np.int32)
+        v_np = np.array(v).astype(np.int32)
+        valid_np = np.array(valid)
+
+        u_np = np.clip(u_np, 0, W - 1)
+        v_np = np.clip(v_np, 0, H - 1)
+
+        depth_np = np.asarray(depth, dtype=np.float32) / depth_scale
+        sampled = depth_np[v_np, u_np]  # (R^3,)
+
+        # --- SDF computation: back to MLX GPU ---
+        sampled_mx = mx.array(sampled)
+        sdf = sampled_mx - z
+
+        valid_mx = valid & (sampled_mx > 0) & (sampled_mx < depth_max) & (
+            mx.abs(sdf) < self.sdf_trunc
+        )
+        tsdf_val = mx.clip(sdf / self.sdf_trunc, -1.0, 1.0)
+
+        # --- Weighted average update: MLX GPU ---
+        tsdf_flat = mx.array(self._tsdf.reshape(-1))
+        w_flat = mx.array(self._weight.reshape(-1))
+
+        w_new = mx.where(valid_mx, w_flat + 1.0, w_flat)
+        t_new = mx.where(
+            valid_mx,
+            (tsdf_flat * w_flat + tsdf_val) / mx.maximum(w_new, 1.0),
+            tsdf_flat,
+        )
+        w_new = mx.minimum(w_new, 255.0)
+
+        # Materialize and store back as numpy (for compatibility with
+        # extract_point_cloud and raycasting which need array indexing)
+        mx.eval(t_new, w_new)
+        self._tsdf = np.array(t_new).reshape(R, R, R)
+        self._weight = np.array(w_new).reshape(R, R, R)
 
         # Optional colour integration
         if color is not None and self._color is not None:
             color_np = np.asarray(color, dtype=np.float32)
-            sampled_color = color_np[vi, ui]  # (R^3, 3)
-            color_flat = self._color.reshape(-1, 3)
-            c_new = np.where(
-                valid[:, None],
-                (color_flat * w_flat[:, None] + sampled_color) / np.maximum(w_new[:, None], 1.0),
+            sampled_color = color_np[v_np, u_np]  # (R^3, 3)
+
+            sampled_color_mx = mx.array(sampled_color)
+            color_flat = mx.array(self._color.reshape(-1, 3))
+
+            c_new = mx.where(
+                valid_mx[:, None],
+                (color_flat * w_flat[:, None] + sampled_color_mx)
+                / mx.maximum(w_new[:, None], 1.0),
                 color_flat,
             )
-            self._color = c_new.reshape(R, R, R, 3)
+            mx.eval(c_new)
+            self._color = np.array(c_new).reshape(R, R, R, 3)
 
     # ------------------------------------------------------------------
     # Surface extraction

@@ -127,19 +127,26 @@ def _read_pcd_ascii(
     header: dict,
 ) -> dict[str, np.ndarray]:
     """Read PCD ASCII data."""
+    import io as _io
+
     n_points = header["points"]
     fields = header["fields"]
     n_fields = len(fields)
 
-    raw = np.empty((n_points, n_fields), dtype=np.float64)
-    for i in range(n_points):
-        line = f.readline().decode("ascii").strip()
-        vals = line.split()
-        if len(vals) < n_fields:
-            raise ValueError(
-                f"PCD line {i}: expected {n_fields} values, got {len(vals)}"
-            )
-        raw[i] = [float(v) for v in vals[:n_fields]]
+    remaining = f.read().decode("ascii")
+    lines = remaining.splitlines()[:n_points]
+    if len(lines) < n_points:
+        raise ValueError(
+            f"PCD ASCII: expected {n_points} data lines, got {len(lines)}"
+        )
+    raw = np.loadtxt(_io.StringIO("\n".join(lines)), dtype=np.float64)
+    if raw.ndim == 1:
+        raw = raw.reshape(1, -1)
+    if raw.shape[1] < n_fields:
+        raise ValueError(
+            f"PCD ASCII: expected {n_fields} columns, got {raw.shape[1]}"
+        )
+    raw = raw[:, :n_fields]
 
     return _extract_pcd_fields(raw, header)
 
@@ -362,25 +369,26 @@ def write_pcd(
             rgb_packed = _pack_pcd_rgb(colors)
 
         if ascii:
-            for i in range(n):
-                parts = [
-                    f"{points[i, 0]:.6f}",
-                    f"{points[i, 1]:.6f}",
-                    f"{points[i, 2]:.6f}",
-                ]
-                if normals is not None:
-                    parts += [
-                        f"{normals[i, 0]:.6f}",
-                        f"{normals[i, 1]:.6f}",
-                        f"{normals[i, 2]:.6f}",
-                    ]
-                if rgb_packed is not None:
-                    # PCD ASCII: write packed RGB as its uint32 integer value
-                    # This is the standard PCL convention and avoids float
-                    # precision loss when round-tripping.
-                    rgb_int = rgb_packed[i].view(np.uint32)
-                    parts.append(str(int(rgb_int)))
-                f.write((" ".join(parts) + "\n").encode("ascii"))
+            # Build float columns and write in bulk
+            float_cols = [points]
+            if normals is not None:
+                float_cols.append(normals)
+            float_data = np.hstack(float_cols)
+
+            if rgb_packed is not None:
+                # PCD ASCII: write packed RGB as its uint32 integer value
+                rgb_ints = rgb_packed.view(np.uint32)
+                lines = []
+                float_fmt = " ".join(["%.6f"] * float_data.shape[1])
+                for i in range(n):
+                    fpart = float_fmt % tuple(float_data[i])
+                    lines.append(fpart + " " + str(int(rgb_ints[i])))
+                f.write(("\n".join(lines) + "\n").encode("ascii"))
+            else:
+                import io as _io
+                buf = _io.BytesIO()
+                np.savetxt(buf, float_data, fmt="%.6f", delimiter=" ")
+                f.write(buf.getvalue())
         else:
             # Binary — build structured array and write in bulk
             dtype_fields = [('x', '<f4'), ('y', '<f4'), ('z', '<f4')]

@@ -1,6 +1,7 @@
 """Ray generation utilities for volume raycasting.
 
 Generates rays from pinhole camera parameters for use in TSDF ray marching.
+Uses MLX for GPU-accelerated ray direction computation and world-frame rotation.
 """
 
 from __future__ import annotations
@@ -18,6 +19,10 @@ def generate_rays(
     height: int | None = None,
 ) -> mx.array:
     """Generate rays for all pixels in a camera view.
+
+    Uses MLX for GPU-accelerated direction computation and rotation
+    to world frame. The pixel grid is constructed in numpy (meshgrid)
+    and converted to MLX once.
 
     Parameters
     ----------
@@ -39,30 +44,45 @@ def generate_rays(
     W = width or intrinsic.width
     H = height or intrinsic.height
 
-    # Pixel grid
-    u = np.arange(W, dtype=np.float32)
-    v = np.arange(H, dtype=np.float32)
-    uu, vv = np.meshgrid(u, v)  # (H, W) each
+    # Pixel grid — numpy meshgrid, normalize in float64 for precision
+    uu, vv = np.meshgrid(
+        np.arange(W, dtype=np.float64),
+        np.arange(H, dtype=np.float64),
+    )
 
-    # Unproject to camera-frame directions
+    # Unproject to camera-frame directions (float64 for normalization precision)
     dx = (uu - intrinsic.cx) / intrinsic.fx
     dy = (vv - intrinsic.cy) / intrinsic.fy
     dz = np.ones_like(dx)
-    dirs_cam = np.stack([dx, dy, dz], axis=-1)  # (H, W, 3)
+    dirs_cam = np.stack([dx, dy, dz], axis=-1)  # (H, W, 3) float64
     norms = np.linalg.norm(dirs_cam, axis=-1, keepdims=True)
-    dirs_cam = dirs_cam / norms
+    dirs_cam = dirs_cam / norms  # unit vectors in float64
 
-    # Transform to world frame
+    # Rotate to world frame — MLX GPU matmul (the expensive part)
     ext = np.asarray(extrinsic, dtype=np.float64)
-    R = ext[:3, :3]
-    t = ext[:3, 3]
+    R_mat = ext[:3, :3]
+    t_vec = ext[:3, 3]
 
-    # Rotate directions to world frame: dirs_world = dirs_cam @ R^T
-    dirs_world = (dirs_cam.reshape(-1, 3) @ R.T).reshape(H, W, 3).astype(np.float32)
-    origins = np.broadcast_to(t.astype(np.float32), dirs_world.shape).copy()
+    # Convert to MLX float32 for GPU-accelerated rotation
+    dirs_cam_mx = mx.array(dirs_cam.reshape(-1, 3).astype(np.float32))
+    R_mx = mx.array(R_mat.astype(np.float32))
+    t_mx = mx.array(t_vec.astype(np.float32))
 
-    rays = np.concatenate([origins, dirs_world], axis=-1)  # (H, W, 6)
-    return mx.array(rays)
+    # (H*W, 3) @ (3, 3)^T → world-frame directions on GPU
+    dirs_world = dirs_cam_mx @ R_mx.T  # MLX GPU matmul
+
+    # Re-normalize after float32 rotation to maintain unit length
+    world_norms = mx.sqrt(mx.sum(dirs_world * dirs_world, axis=-1, keepdims=True))
+    dirs_world = dirs_world / mx.maximum(world_norms, 1e-10)
+
+    dirs_world = mx.reshape(dirs_world, (H, W, 3))
+
+    # Broadcast origin to all pixels
+    origins = mx.broadcast_to(t_mx, dirs_world.shape)
+
+    rays = mx.concatenate([origins, dirs_world], axis=-1)  # (H, W, 6)
+    mx.eval(rays)
+    return rays
 
 
 def generate_rays_flat(

@@ -21,6 +21,7 @@ from open3d_mlx.ops.fixed_radius_nn import FixedRadiusIndex
 from open3d_mlx.pipelines.registration.convergence import ICPConvergenceCriteria
 from open3d_mlx.pipelines.registration.correspondence import find_correspondences
 from open3d_mlx.pipelines.registration.result import RegistrationResult
+from open3d_mlx.pipelines.registration.robust_kernel import RobustKernel
 from open3d_mlx.pipelines.registration.transformation import (
     TransformationEstimationForColoredICP,
     TransformationEstimationForGeneralizedICP,
@@ -38,10 +39,14 @@ def registration_icp(
         Union[
             TransformationEstimationPointToPoint,
             TransformationEstimationPointToPlane,
+            TransformationEstimationForColoredICP,
+            TransformationEstimationForGeneralizedICP,
         ]
     ] = None,
     criteria: Optional[ICPConvergenceCriteria] = None,
     voxel_size: float = -1.0,
+    kernel: Optional[RobustKernel] = None,
+    correspondence_checkers: Optional[list] = None,
 ) -> RegistrationResult:
     """ICP registration: align source to target via iterative closest point.
 
@@ -62,6 +67,12 @@ def registration_icp(
         Convergence criteria.  Defaults to ``ICPConvergenceCriteria()``.
     voxel_size : float
         If > 0, downsample both clouds before registration.
+    kernel : RobustKernel or None
+        Robust kernel for outlier down-weighting in IRLS.  If ``None``,
+        standard (unweighted) least-squares is used.
+    correspondence_checkers : list or None
+        List of correspondence checker instances.  After finding
+        correspondences, each checker filters invalid ones.
 
     Returns
     -------
@@ -143,10 +154,8 @@ def registration_icp(
             converged=False,
         )
 
-    # Apply initial transformation to source
-    source_transformed = src.clone().transform(
-        mx.array(T_cumulative.astype(np.float32))
-    )
+    # Cache source points in numpy for incremental transformation
+    source_pts_np = np.array(src.points, dtype=np.float64)
 
     # Build target index once (target does not move)
     target_index = FixedRadiusIndex(tgt.points, max_correspondence_distance)
@@ -154,17 +163,70 @@ def registration_icp(
     prev_fitness = 0.0
     prev_rmse = float("inf")
     converged = False
+    num_inliers = 0
     fitness = 0.0
     rmse = float("inf")
     correspondences = None
 
     for i in range(criteria.max_iteration):
-        # 1. Find correspondences
+        # 1. Compute transformed source points incrementally
+        R_cum = T_cumulative[:3, :3]
+        t_cum = T_cumulative[:3, 3]
+        transformed_pts = (source_pts_np @ R_cum.T + t_cum).astype(np.float32)
+        transformed_pts_mx = mx.array(transformed_pts)
+
+        # 2. Find correspondences
         correspondences, sq_dists = find_correspondences(
-            source_transformed.points, target_index, max_correspondence_distance
+            transformed_pts_mx, target_index, max_correspondence_distance
         )
 
-        # 2. Compute metrics
+        # 3. Apply correspondence checkers
+        if correspondence_checkers:
+            corr_np_check = np.array(correspondences, dtype=np.int32)
+            valid_mask = corr_np_check >= 0  # Start with inlier mask
+
+            from open3d_mlx.pipelines.registration.correspondence_checker import (
+                CorrespondenceCheckerBasedOnDistance,
+                CorrespondenceCheckerBasedOnEdgeLength,
+                CorrespondenceCheckerBasedOnNormal,
+            )
+
+            for checker in correspondence_checkers:
+                if isinstance(checker, CorrespondenceCheckerBasedOnDistance):
+                    checker_valid = checker.check(
+                        transformed_pts_mx, tgt.points, correspondences, sq_dists
+                    )
+                elif isinstance(checker, CorrespondenceCheckerBasedOnEdgeLength):
+                    checker_valid = checker.check(
+                        transformed_pts_mx, tgt.points, correspondences
+                    )
+                elif isinstance(checker, CorrespondenceCheckerBasedOnNormal):
+                    if src.has_normals() and tgt.has_normals():
+                        # Rotate source normals by cumulative rotation
+                        src_normals_np = np.array(src.normals, dtype=np.float64)
+                        rotated_normals = (src_normals_np @ R_cum.T).astype(np.float32)
+                        checker_valid = checker.check(
+                            mx.array(rotated_normals), tgt.normals, correspondences
+                        )
+                    else:
+                        # Skip normal check if normals not available
+                        checker_valid = valid_mask
+                else:
+                    continue
+
+                valid_mask &= checker_valid
+
+            # Update correspondences: set filtered ones to -1
+            new_corr = corr_np_check.copy()
+            new_corr[~valid_mask] = -1
+            correspondences = mx.array(new_corr)
+
+            # Update sq_dists for filtered correspondences
+            sq_dists_np = np.array(sq_dists, dtype=np.float32)
+            sq_dists_np[~valid_mask] = float("inf")
+            sq_dists = mx.array(sq_dists_np)
+
+        # 4. Compute metrics
         corr_np = np.array(correspondences, dtype=np.int32)
         inlier_mask = corr_np >= 0
         num_inliers = int(inlier_mask.sum())
@@ -177,7 +239,7 @@ def registration_icp(
         inlier_sq_dists = sq_dists_np[inlier_mask]
         rmse = float(np.sqrt(inlier_sq_dists.mean()))
 
-        # 3. Check convergence (skip first iteration — no previous to compare)
+        # 5. Check convergence (skip first iteration -- no previous to compare)
         if i > 0:
             delta_fitness = abs(fitness - prev_fitness)
             delta_rmse = abs(rmse - prev_rmse)
@@ -191,50 +253,65 @@ def registration_icp(
         prev_fitness = fitness
         prev_rmse = rmse
 
-        # 4. Estimate incremental transformation
+        # 6. Compute robust kernel weights if provided
+        weights_np = None
+        if kernel is not None:
+            # Compute distances (not squared) for the residuals
+            distances_inlier = np.sqrt(inlier_sq_dists)
+            weights_mx = kernel.weight(mx.array(distances_inlier.astype(np.float32)))
+            mx.eval(weights_mx)
+            weights_np = np.array(weights_mx, dtype=np.float64)
+
+        # 7. Estimate incremental transformation
         if is_colored:
+            # For colored ICP, need to get colors for transformed source
             T_step = estimation_method.compute_transformation(
-                source_transformed.points,
+                transformed_pts_mx,
                 tgt.points,
-                source_transformed.colors,
+                src.colors,
                 tgt.colors,
                 tgt.normals,
                 correspondences,
+                weights=weights_np,
             )
         elif is_point_to_plane:
             T_step = estimation_method.compute_transformation(
-                source_transformed.points,
+                transformed_pts_mx,
                 tgt.points,
                 tgt.normals,
                 correspondences,
+                weights=weights_np,
             )
         elif is_gicp:
             T_step = estimation_method.compute_transformation(
-                source_transformed.points,
+                transformed_pts_mx,
                 tgt.points,
                 correspondences,
+                weights=weights_np,
             )
         else:
             T_step = estimation_method.compute_transformation(
-                source_transformed.points,
+                transformed_pts_mx,
                 tgt.points,
                 correspondences,
+                weights=weights_np,
             )
 
-        # 5. Apply step and accumulate in float64
+        # 8. Accumulate in float64
         T_step_np = np.array(T_step, dtype=np.float64)
         T_cumulative = T_step_np @ T_cumulative
 
-        # Re-transform original source by cumulative transform
-        source_transformed = src.clone().transform(
-            mx.array(T_cumulative.astype(np.float32))
-        )
-
     # Final evaluation after the loop
     if correspondences is not None and num_inliers > 0:
+        # Compute final transformed points
+        R_cum = T_cumulative[:3, :3]
+        t_cum = T_cumulative[:3, 3]
+        final_pts = (source_pts_np @ R_cum.T + t_cum).astype(np.float32)
+        final_pts_mx = mx.array(final_pts)
+
         # Re-evaluate correspondences with the final transformed source
         correspondences, sq_dists = find_correspondences(
-            source_transformed.points, target_index, max_correspondence_distance
+            final_pts_mx, target_index, max_correspondence_distance
         )
         corr_np = np.array(correspondences, dtype=np.int32)
         inlier_mask = corr_np >= 0
@@ -358,6 +435,7 @@ def multi_scale_icp(
             TransformationEstimationForGeneralizedICP,
         ]
     ] = None,
+    kernel: Optional[RobustKernel] = None,
 ) -> RegistrationResult:
     """Coarse-to-fine multi-scale ICP registration.
 
@@ -380,6 +458,8 @@ def multi_scale_icp(
         Initial ``(4, 4)`` transformation.  Defaults to identity.
     estimation_method : estimation class or None
         Transformation estimation method.  Defaults to point-to-point.
+    kernel : RobustKernel or None
+        Robust kernel for outlier down-weighting.
 
     Returns
     -------
@@ -433,6 +513,7 @@ def multi_scale_icp(
             init_source_to_target=T,
             estimation_method=estimation_method,
             criteria=crit,
+            kernel=kernel,
         )
         T = result.transformation
 

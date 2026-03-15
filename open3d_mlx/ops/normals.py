@@ -2,6 +2,10 @@
 
 Computes surface normals by analyzing local neighborhoods using
 singular value decomposition (SVD) of the local covariance matrix.
+
+The batched path (``estimate_normals_pca_batched``) is fully MLX-native
+and runs on GPU. The general path (``estimate_normals_pca``) handles
+-1 padding by using numpy batched SVD (no per-point Python loops).
 """
 
 from __future__ import annotations
@@ -16,9 +20,13 @@ def estimate_normals_pca(
 ) -> mx.array:
     """Estimate normals using PCA on local neighborhoods.
 
-    For each point, gathers its K neighbors, centers the neighborhood,
-    computes the 3x3 covariance matrix, and takes the smallest singular
-    vector as the surface normal.
+    Fully vectorized: gathers all neighbors at once, computes batch
+    covariance matrices, and runs a single batched SVD. No Python
+    loops over individual points.
+
+    Handles -1 padding in ``neighbor_indices`` by replacing invalid
+    entries with the point's own index (which contributes zero to the
+    centered covariance).
 
     Args:
         points: (N, 3) point positions.
@@ -45,54 +53,69 @@ def estimate_normals_pca(
 
     N, K = neighbor_indices.shape
 
-    # Convert to numpy for SVD (MLX batched SVD may not be available)
-    points_np = np.array(points, dtype=np.float64)
-    indices_np = np.array(neighbor_indices, dtype=np.int32)
+    # Move to numpy for batched SVD (MLX SVD works but numpy is more
+    # robust for degenerate covariance matrices)
+    mx.eval(points, neighbor_indices)
+    pts_np = np.array(points, dtype=np.float64)
+    idx_np = np.array(neighbor_indices, dtype=np.int32)
 
-    normals_np = np.zeros((N, 3), dtype=np.float64)
+    # Valid-neighbor mask: (N, K)
+    valid_mask = idx_np >= 0
 
-    for i in range(N):
-        # Get valid neighbor indices (exclude -1 padding)
-        idx = indices_np[i]
-        valid_mask = idx >= 0
-        valid_idx = idx[valid_mask]
+    # Replace -1 with the point's own index (safe gather, contributes
+    # zero after centering)
+    own_idx = np.arange(N, dtype=np.int32)[:, None]  # (N, 1)
+    idx_safe = np.where(valid_mask, idx_np, own_idx)
 
-        if len(valid_idx) < 3:
-            # Not enough neighbors for a reliable normal; default to z-axis
-            normals_np[i] = [0.0, 0.0, 1.0]
-            continue
+    # Gather ALL neighbors at once: (N, K, 3)
+    neighbors = pts_np[idx_safe]
 
-        # Gather neighbors and center
-        neighbors = points_np[valid_idx]  # (Kv, 3)
-        centroid = np.mean(neighbors, axis=0, keepdims=True)  # (1, 3)
-        centered = neighbors - centroid  # (Kv, 3)
+    # Count valid neighbors per point: (N,)
+    valid_counts = valid_mask.sum(axis=1)
 
-        # Covariance matrix
-        cov = (centered.T @ centered) / len(valid_idx)  # (3, 3)
+    # Compute centroids: (N, 3)
+    # Zero out invalid slots before summing
+    valid_mask_3d = valid_mask[:, :, None]  # (N, K, 1)
+    neighbor_sum = np.where(valid_mask_3d, neighbors, 0.0).sum(axis=1)  # (N, 3)
+    centroids = neighbor_sum / np.maximum(valid_counts[:, None], 1)
 
-        # SVD: smallest singular vector = normal
-        try:
-            _, S, Vt = np.linalg.svd(cov)
-            normals_np[i] = Vt[-1]  # Last row = smallest eigenvector
-        except np.linalg.LinAlgError:
-            normals_np[i] = [0.0, 0.0, 1.0]
+    # Center neighborhoods: (N, K, 3)
+    centered = neighbors - centroids[:, None, :]
+    centered = np.where(valid_mask_3d, centered, 0.0)
+
+    # Batch covariance: (N, 3, 3) via einsum
+    cov = np.einsum("nki,nkj->nij", centered, centered)
+    cov /= np.maximum(valid_counts[:, None, None], 1)
+
+    # Batch SVD — numpy handles (N, 3, 3) natively
+    _, _, Vt = np.linalg.svd(cov)  # Vt: (N, 3, 3)
+
+    # Normal = last row of Vt (smallest singular vector)
+    normals = Vt[:, 2, :]  # (N, 3)
+
+    # For points with < 3 valid neighbors, use default z-axis normal
+    degenerate = valid_counts < 3
+    normals[degenerate] = [0.0, 0.0, 1.0]
 
     # Normalize to unit length
-    norms = np.linalg.norm(normals_np, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-12)  # avoid division by zero
-    normals_np = normals_np / norms
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = np.where(norms > 1e-12, normals / norms, 0.0)
 
-    return mx.array(normals_np.astype(np.float32))
+    # Final safety: any zero-norm rows get z-axis
+    zero_mask = np.linalg.norm(normals, axis=1) < 1e-8
+    normals[zero_mask] = [0.0, 0.0, 1.0]
+
+    return mx.array(normals.astype(np.float32))
 
 
 def estimate_normals_pca_batched(
     points: mx.array,
     neighbor_indices: mx.array,
 ) -> mx.array:
-    """Estimate normals using batched MLX operations (faster for large N).
+    """Estimate normals using fully MLX-native batched operations (GPU).
 
-    Same as estimate_normals_pca but uses MLX matmul and SVD for the
-    batch. Requires all neighbor slots to be valid (no -1 padding).
+    Faster than ``estimate_normals_pca`` when all neighbor slots are
+    valid (no -1 padding). Runs entirely on Apple Silicon GPU via MLX.
 
     Args:
         points: (N, 3) point positions.
@@ -136,6 +159,8 @@ def orient_normals_towards_viewpoint(
     viewpoint: mx.array | None = None,
 ) -> mx.array:
     """Orient normals to consistently point towards a viewpoint.
+
+    Runs entirely on GPU via MLX.
 
     Args:
         points: (N, 3) point positions.

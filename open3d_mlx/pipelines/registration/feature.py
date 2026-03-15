@@ -28,8 +28,9 @@ def compute_fpfh_feature(pcd, search_param):
 
     Algorithm
     ---------
-    1. For each point, find neighbours within *radius*.
-    2. Compute SPFH (Simplified Point Feature Histogram):
+    1. For each point, find neighbours within *radius* using hybrid search.
+    2. Compute SPFH (Simplified Point Feature Histogram) via vectorized
+       per-neighbor-slot passes:
        - Establish a Darboux frame: u = n1, v = (u x d) / ||u x d||, w = u x v
        - Compute angles: alpha = v . n2, phi = u . d, theta = atan2(w . n2, u . n2)
        - Bin each angle into 11 bins -> 33-dim histogram.
@@ -40,9 +41,9 @@ def compute_fpfh_feature(pcd, search_param):
 
     from open3d_mlx.ops import NearestNeighborSearch
 
-    pts_np = np.asarray(pcd.points, dtype=np.float64)
-    normals_np = np.asarray(pcd.normals, dtype=np.float64)
-    N = len(pts_np)
+    pts = np.asarray(pcd.points, dtype=np.float64)
+    normals = np.asarray(pcd.normals, dtype=np.float64)
+    N = len(pts)
 
     # Get search radius / max_nn from param
     if hasattr(search_param, "radius"):
@@ -56,87 +57,80 @@ def compute_fpfh_feature(pcd, search_param):
     n_bins = 11  # bins per angle feature
     n_features = n_bins * 3  # 33
 
-    # Step 1: radius search for all points
-    indices_list, dists_list = nns.radius_search(pcd.points, radius, max_nn=max_nn)
+    # Use hybrid search for fixed-size padded output: (N, max_nn)
+    indices, dists, counts = nns.hybrid_search(pcd.points, radius, max_nn)
+    idx_np = np.array(indices)    # (N, max_nn) int32, padded with -1
+    dist_np = np.array(dists)     # (N, max_nn) float32, padded with inf
+    count_np = np.array(counts)   # (N,) int32
 
-    # Step 2: Compute SPFH for every point
+    # ── VECTORIZED SPFH computation ──────────────────────────────────────
+    # Instead of O(N*K) Python loops, iterate over K neighbor slots
+    # with fully vectorized NumPy operations over all N points per slot.
+
     spfh = np.zeros((N, n_features), dtype=np.float32)
 
-    for i in range(N):
-        idx = np.asarray(indices_list[i], dtype=np.int64)
-        if len(idx) < 2:
+    for k in range(max_nn):
+        j_indices = idx_np[:, k]  # (N,) — neighbor index for slot k
+        valid = (j_indices >= 0) & (k < count_np)  # (N,) bool mask
+
+        if not valid.any():
             continue
 
-        p1 = pts_np[i]
-        n1 = normals_np[i]
+        # Gather neighbor positions and normals (use 0 for invalid to avoid OOB)
+        j_safe = np.where(valid, j_indices, 0)
+        p2 = pts[j_safe]       # (N, 3)
+        n2 = normals[j_safe]   # (N, 3)
 
-        hist = np.zeros(n_features, dtype=np.float32)
-        count = 0
+        diff = p2 - pts  # (N, 3)
+        d = np.linalg.norm(diff, axis=1, keepdims=True)  # (N, 1)
+        d = np.maximum(d, 1e-10)
+        diff_norm = diff / d  # (N, 3)
 
-        for j in idx:
-            j = int(j)
-            if j == i:
-                continue
+        # Darboux frame
+        u = normals  # (N, 3)
+        v = np.cross(u, diff_norm)  # (N, 3)
+        v_norm = np.linalg.norm(v, axis=1, keepdims=True)
+        v_valid = (v_norm > 1e-10).squeeze()
+        valid = valid & v_valid
+        v_norm = np.maximum(v_norm, 1e-10)
+        v = v / v_norm
+        w = np.cross(u, v)  # (N, 3)
 
-            p2 = pts_np[j]
-            n2 = normals_np[j]
+        # Angles
+        alpha = np.clip(np.sum(v * n2, axis=1), -1, 1)  # (N,)
+        phi = np.clip(np.sum(u * diff_norm, axis=1), -1, 1)  # (N,)
+        theta = np.arctan2(
+            np.sum(w * n2, axis=1), np.sum(u * n2, axis=1)
+        )  # (N,)
 
-            diff = p2 - p1
-            d = np.linalg.norm(diff)
-            if d < 1e-10:
-                continue
+        # Bin into [0, n_bins - 1]
+        a_bin = np.clip(((alpha + 1) / 2 * n_bins).astype(np.int32), 0, n_bins - 1)
+        p_bin = np.clip(((phi + 1) / 2 * n_bins).astype(np.int32), 0, n_bins - 1)
+        t_bin = np.clip(
+            ((theta / np.pi + 1) / 2 * n_bins).astype(np.int32), 0, n_bins - 1
+        )
 
-            # Darboux frame
-            u = n1
-            v = np.cross(u, diff / d)
-            v_norm = np.linalg.norm(v)
-            if v_norm < 1e-10:
-                continue
-            v = v / v_norm
-            w = np.cross(u, v)
+        # Accumulate into histogram (vectorized scatter via np.add.at)
+        valid_idx = np.where(valid)[0]
+        np.add.at(spfh, (valid_idx, a_bin[valid_idx]), 1)
+        np.add.at(spfh, (valid_idx, n_bins + p_bin[valid_idx]), 1)
+        np.add.at(spfh, (valid_idx, 2 * n_bins + t_bin[valid_idx]), 1)
 
-            # Angles
-            alpha = float(np.clip(np.dot(v, n2), -1.0, 1.0))
-            phi = float(np.clip(np.dot(u, diff / d), -1.0, 1.0))
-            theta = float(np.arctan2(np.dot(w, n2), np.dot(u, n2)))
+    # Normalize SPFH
+    total = np.maximum(count_np[:, None], 1).astype(np.float32)
+    spfh /= total
 
-            # Bin into [0, n_bins - 1]
-            a_bin = int(np.clip((alpha + 1.0) / 2.0 * n_bins, 0, n_bins - 1))
-            p_bin = int(np.clip((phi + 1.0) / 2.0 * n_bins, 0, n_bins - 1))
-            t_bin = int(
-                np.clip((theta / np.pi + 1.0) / 2.0 * n_bins, 0, n_bins - 1)
-            )
+    # ── FPFH = SPFH + weighted sum of neighbor SPFHs ────────────────────
+    fpfh = spfh.copy()
+    for k in range(max_nn):
+        j_indices = idx_np[:, k]
+        valid = (j_indices >= 0) & (k < count_np)
+        j_safe = np.where(valid, j_indices, 0)
 
-            hist[a_bin] += 1
-            hist[n_bins + p_bin] += 1
-            hist[2 * n_bins + t_bin] += 1
-            count += 1
+        d = np.sqrt(np.maximum(dist_np[:, k], 1e-10))
+        w = 1.0 / d
+        w = np.where(valid, w, 0.0)
 
-        if count > 0:
-            spfh[i] = hist / count
-
-    # Step 3: Weight neighbour SPFHs -> FPFH
-    fpfh = np.zeros_like(spfh)
-    for i in range(N):
-        idx = np.asarray(indices_list[i], dtype=np.int64)
-        dists = np.asarray(dists_list[i], dtype=np.float32)
-
-        if len(idx) == 0:
-            fpfh[i] = spfh[i]
-            continue
-
-        # Inverse-distance weights
-        weights = np.zeros(len(idx), dtype=np.float64)
-        for k in range(len(idx)):
-            d = float(np.sqrt(dists[k]))
-            weights[k] = 1.0 / max(d, 1e-10)
-
-        weighted_sum = np.zeros(n_features, dtype=np.float64)
-        for k in range(len(idx)):
-            weighted_sum += weights[k] * spfh[int(idx[k])]
-
-        total_weight = weights.sum()
-        if total_weight > 0:
-            fpfh[i] = spfh[i] + (weighted_sum / total_weight).astype(np.float32)
+        fpfh += w[:, None] * spfh[j_safe]
 
     return mx.array(fpfh)

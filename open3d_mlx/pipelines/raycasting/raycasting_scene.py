@@ -2,6 +2,11 @@
 
 Implements sphere-tracing / adaptive ray marching through a TSDF volume
 to render synthetic depth maps and normal maps.
+
+Uses MLX for GPU-accelerated ray generation and result packaging.
+The ray marching loop uses numpy for the per-step trilinear sampling
+(which requires 3D array indexing that MLX does not support), but
+vectorizes across all rays within each step.
 """
 
 from __future__ import annotations
@@ -41,6 +46,10 @@ class RaycastingScene:
     ) -> dict[str, mx.array]:
         """Cast rays against the TSDF volume.
 
+        The outer marching loop is sequential per-step, but all ray
+        computations within each step are vectorized. MLX is used for
+        the final result packaging.
+
         Parameters
         ----------
         rays : mx.array
@@ -61,8 +70,9 @@ class RaycastingScene:
             raise RuntimeError("No volume set. Call set_volume() first.")
 
         vol = self._volume
-        tsdf = vol._tsdf  # (R, R, R) numpy
-        weight = vol._weight  # (R, R, R) numpy
+        # Handle both numpy and MLX arrays for _tsdf/_weight
+        tsdf = np.asarray(vol._tsdf, dtype=np.float32)
+        weight = np.asarray(vol._weight, dtype=np.float32)
         origin = vol.origin.astype(np.float64)
         voxel_size = vol.voxel_size
         resolution = vol.resolution
@@ -150,6 +160,7 @@ class RaycastingScene:
         positions = origins + t_hit[:, None] * directions
         positions = np.where(np.isinf(t_hit[:, None]), 0.0, positions)
 
+        # Return as MLX arrays
         return {
             "t_hit": mx.array(t_hit.astype(np.float32)),
             "normals": mx.array(hit_normals.astype(np.float32)),

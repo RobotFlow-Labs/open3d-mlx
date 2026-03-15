@@ -867,18 +867,20 @@ class PointCloud:
     def clone(self) -> "PointCloud":
         """Create an independent deep copy.
 
+        Uses ``mx.array()`` copy constructor instead of the wasteful
+        ``arr + mx.zeros_like(arr)`` pattern.
+
         Returns
         -------
         PointCloud
         """
         new_pcd = PointCloud()
         if self._points is not None:
-            # Use addition of zero to force a copy in MLX
-            new_pcd._points = self._points + mx.zeros_like(self._points)
+            new_pcd._points = mx.array(self._points)
         if self._normals is not None:
-            new_pcd._normals = self._normals + mx.zeros_like(self._normals)
+            new_pcd._normals = mx.array(self._normals)
         if self._colors is not None:
-            new_pcd._colors = self._colors + mx.zeros_like(self._colors)
+            new_pcd._colors = mx.array(self._colors)
         return new_pcd
 
     # ------------------------------------------------------------------

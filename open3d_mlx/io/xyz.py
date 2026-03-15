@@ -49,7 +49,7 @@ def read_xyz(filepath: str | Path) -> dict[str, np.ndarray]:
 
     if data.shape[1] >= 9:
         colors = data[:, 6:9]
-        if colors.max() > 1.0:
+        if colors.max() > 2.0:  # Clearly uint8 range, not edge-case floats
             colors = colors / 255.0
         result["colors"] = colors.astype(np.float32)
 

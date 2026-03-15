@@ -127,17 +127,23 @@ def _read_ascii(
     properties: list[tuple[str, str]],
 ) -> dict[str, np.ndarray]:
     """Read ASCII PLY vertex data."""
-    n_props = len(properties)
-    raw = np.empty((vertex_count, n_props), dtype=np.float64)
+    import io as _io
 
-    for i in range(vertex_count):
-        line = f.readline().decode("ascii").strip()
-        vals = line.split()
-        if len(vals) < n_props:
-            raise ValueError(
-                f"PLY line {i}: expected {n_props} values, got {len(vals)}"
-            )
-        raw[i] = [float(v) for v in vals[:n_props]]
+    n_props = len(properties)
+    remaining = f.read().decode("ascii")
+    lines = remaining.splitlines()[:vertex_count]
+    if len(lines) < vertex_count:
+        raise ValueError(
+            f"PLY ASCII: expected {vertex_count} vertex lines, got {len(lines)}"
+        )
+    raw = np.loadtxt(_io.StringIO("\n".join(lines)), dtype=np.float64)
+    if raw.ndim == 1:
+        raw = raw.reshape(1, -1)
+    if raw.shape[1] < n_props:
+        raise ValueError(
+            f"PLY ASCII: expected {n_props} columns, got {raw.shape[1]}"
+        )
+    raw = raw[:, :n_props]
 
     return _extract_fields(raw, properties)
 
@@ -163,11 +169,6 @@ def _read_binary(
 
     # Build a numpy structured dtype for efficient parsing
     np_bo = "<" if byte_order == "binary_little_endian" else ">"
-    dtype_list = [
-        (name, np_bo + _PLY_TYPE_TO_STRUCT[pt].replace("b", "i1").replace("B", "u1"))
-        for name, pt in properties
-    ]
-    # Use np.frombuffer with structured dtype
     np_dtype = np.dtype(
         [(name, np.dtype(f"{np_bo}{_PLY_TYPE_TO_STRUCT[pt]}").str) for name, pt in properties]
     )
@@ -340,21 +341,26 @@ def write_ply(
             return
 
         if ascii:
-            for i in range(n):
-                parts = [f"{points[i, 0]:.6f}", f"{points[i, 1]:.6f}", f"{points[i, 2]:.6f}"]
-                if normals is not None:
-                    parts += [
-                        f"{normals[i, 0]:.6f}",
-                        f"{normals[i, 1]:.6f}",
-                        f"{normals[i, 2]:.6f}",
-                    ]
-                if colors is not None:
-                    parts += [
-                        str(colors[i, 0]),
-                        str(colors[i, 1]),
-                        str(colors[i, 2]),
-                    ]
-                f.write((" ".join(parts) + "\n").encode("ascii"))
+            # Build all columns and write in bulk
+            float_cols = [points]
+            if normals is not None:
+                float_cols.append(normals)
+            float_data = np.hstack(float_cols)
+
+            if colors is not None:
+                # Write float columns + uint8 color columns
+                lines = []
+                float_fmt = " ".join(["%.6f"] * float_data.shape[1])
+                for i in range(n):
+                    fpart = float_fmt % tuple(float_data[i])
+                    cpart = f"{colors[i, 0]} {colors[i, 1]} {colors[i, 2]}"
+                    lines.append(fpart + " " + cpart)
+                f.write(("\n".join(lines) + "\n").encode("ascii"))
+            else:
+                import io as _io
+                buf = _io.BytesIO()
+                np.savetxt(buf, float_data, fmt="%.6f", delimiter=" ")
+                f.write(buf.getvalue())
         else:
             # Binary little-endian — build structured array and write in bulk
             dtype_fields = [('x', '<f4'), ('y', '<f4'), ('z', '<f4')]
